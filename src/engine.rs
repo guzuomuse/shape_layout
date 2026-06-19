@@ -30,7 +30,7 @@ use crate::rules::{HAlign, LayoutConfig};
 /// # 算法
 ///
 /// ```text
-/// y = padding_top
+/// y = container.y0 + padding_top
 /// while 有剩余元素:
 ///     row_h = 下一批元素的预估行高
 ///     intervals = rg.get_intervals_at(y, row_h)
@@ -52,16 +52,17 @@ pub fn layout_rows(
     };
 
     let max_y = rg.extents.y1 - config.padding_bottom;
+    let container_y0 = rg.extents.y0;
     let mut placed: Vec<PlacedElement> = Vec::new();
     let mut warnings: Vec<LayoutWarning> = Vec::new();
     let mut unplaced: Vec<String> = Vec::new();
 
-    let mut y = config.padding_top;
+    let mut y = container_y0 + config.padding_top;
     let mut idx: usize = 0;
 
     while idx < elements.len() {
-        // 检查容器底部溢出
-        if y >= max_y {
+        // 检查容器底部溢出（留 1e-9 容差，避免误杀刚好贴底的行）
+        if y > max_y + 1e-9 {
             for i in idx..elements.len() {
                 warnings.push(LayoutWarning::Overflow {
                     element_id: elements[i].id.clone(),
@@ -83,7 +84,7 @@ pub fn layout_rows(
 
         if row_range.is_empty() {
             // 无可用的行区间，推进 Y 继续尝试
-            y += 0.5;
+            y += config.step_size;
             continue;
         }
 
@@ -103,7 +104,7 @@ pub fn layout_rows(
 
         // 边界保护
         if interval_r - interval_l <= 0.0 {
-            y += 0.5;
+            y += config.step_size;
             continue;
         }
 
@@ -153,6 +154,28 @@ pub fn layout_rows(
             }) {
                 interval_l = widest_refined.0 + config.padding_left;
                 interval_r = widest_refined.1 - config.padding_right;
+            }
+        }
+
+        // 校验 refinement 后的区间仍能容纳行内元素（防止沙漏形容器因行高增大
+        // 导致区间缩水到放不下已打包元素，退回原始区间）
+        if !row_indices.is_empty() {
+            let row_min_span: f64 = row_indices
+                .iter()
+                .map(|&ri| {
+                    let e = &elements[ri];
+                    if e.constraints.shrinkable {
+                        e.constraints.min_width.unwrap_or(0.0)
+                    } else {
+                        e.width
+                    }
+                })
+                .sum::<f64>()
+                + (row_indices.len().saturating_sub(1)) as f64 * config.gap;
+            if interval_r - interval_l < row_min_span - 1e-9 {
+                // refinement 后区间太窄，回退到原始区间
+                interval_l = widest.0 + config.padding_left;
+                interval_r = widest.1 - config.padding_right;
             }
         }
 
@@ -314,10 +337,17 @@ fn solve_row_x(
         let elem = &elements[row_indices[i]];
         let preferred_w = elem.effective_width();
 
-        // right_i - left_i == preferred_width (STRONG)
+        // right_i - left_i == preferred_width
+        // 不可缩元素用 REQUIRED（硬锁，宁愿求解失败也不允许被压扁）
+        // 可缩元素用 STRONG（边界约束为 REQUIRED 时 kasuari 会自动缩短）
+        let width_strength = if elem.constraints.shrinkable {
+            Strength::STRONG
+        } else {
+            Strength::REQUIRED
+        };
         solver
             .add_constraints(
-                [(right_vars[i] - left_vars[i]) | EQ(Strength::STRONG) | preferred_w],
+                [(right_vars[i] - left_vars[i]) | EQ(width_strength) | preferred_w],
             )
             .map_err(|e| format!("add_constraint width==preferred failed: {e:?}"))?;
 
@@ -486,5 +516,152 @@ mod tests {
         let solution = layout_rows(&container, &elements, &config);
         assert!(!solution.is_fully_placed());
         assert_eq!(solution.unplaced.len(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 异形容器集成测试（对应 P0/P1 Bug 修复）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 直角三角形：顶部宽，底部窄
+    fn right_triangle(x: f64, y: f64, base: f64, height: f64) -> BezPath {
+        let mut p = BezPath::new();
+        p.move_to((x, y));
+        p.line_to((x + base, y));
+        p.line_to((x, y + height));
+        p.close_path();
+        p
+    }
+
+    /// Bug 1 修复验证 —— 容器不在原点时元素应相对于容器放置
+    #[test]
+    fn test_container_at_offset() {
+        // 容器在 (50, 100)，100x100
+        let container = square(50.0, 100.0, 100.0);
+        let elements = vec![
+            LayoutElement::new("a", 40.0, 20.0),
+            LayoutElement::new("b", 40.0, 20.0),
+        ];
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "unplaced: {:?}, warnings: {:?}",
+            solution.unplaced,
+            solution.warnings
+        );
+
+        // 元素 Y 应该 ≥ container_y0 + padding_top = 105
+        for placed in &solution.placed {
+            assert!(
+                placed.y >= 105.0,
+                "element '{}' y={} < 105 (should be >= container_y0 + padding_top)",
+                placed.id,
+                placed.y
+            );
+            // X 应该 ≥ container_x0 + padding_left = 55
+            assert!(
+                placed.x >= 55.0 - 1e-6,
+                "element '{}' x={} < 55 (should be >= container_x0 + padding_left)",
+                placed.id,
+                placed.x
+            );
+        }
+    }
+
+    /// Bug 4 修复验证 —— 元素高度恰好贴底时不应被误杀
+    #[test]
+    fn test_bottom_fit() {
+        // 20 高的容器，20 高的元素，刚好贴底
+        let mut container = BezPath::new();
+        container.move_to((0.0, 0.0));
+        container.line_to((100.0, 0.0));
+        container.line_to((100.0, 20.0));
+        container.line_to((0.0, 20.0));
+        container.close_path();
+
+        let elements = vec![LayoutElement::new("fits_exactly", 40.0, 20.0)];
+        let config = LayoutConfig::default(); // no padding
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "should fit at exact bottom, got unplaced: {:?}",
+            solution.unplaced
+        );
+        assert_eq!(solution.placed[0].y, 0.0);
+    }
+
+    /// Bug 2 修复验证 —— 不可缩元素在可容纳时正常排放
+    #[test]
+    fn test_non_shrinkable_protection() {
+        let container = square(0.0, 0.0, 60.0);
+        let element = LayoutElement::new("fixed", 50.0, 20.0);
+        // constraints 默认 shrinkable=false，无需额外设置
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+
+        let solution = layout_rows(&container, &[element], &config);
+        // 可用宽度 = 60 - 5*2 = 50，元素正好 50 → 应放置
+        assert!(
+            solution.is_fully_placed(),
+            "50-wide element in 60-wide container should fit"
+        );
+    }
+
+    /// Bug 2 修复验证 —— 不可缩元素过宽时拒绝被压扁
+    #[test]
+    fn test_non_shrinkable_refused() {
+        let container = square(0.0, 0.0, 40.0);
+        let mut fixed = LayoutElement::new("fixed", 50.0, 20.0);
+        fixed.constraints.shrinkable = false;
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+
+        let solution = layout_rows(&container, &[fixed], &config);
+        // 可用宽度 = 40 - 10 = 30，元素 50 且不可缩 → unplaced
+        assert!(
+            !solution.is_fully_placed(),
+            "non-shrinkable 50-wide element should not fit in 30-wide interval"
+        );
+        assert_eq!(solution.unplaced.len(), 1);
+        assert_eq!(solution.unplaced[0], "fixed");
+    }
+
+    /// 窄缩容器（三角形）：顶部宽、底部窄，底部元素可能放不下
+    #[test]
+    fn test_narrowing_triangle() {
+        let container = right_triangle(0.0, 0.0, 100.0, 100.0);
+        let elements: Vec<LayoutElement> = (0..6)
+            .map(|i| LayoutElement::new(&format!("e{i}"), 30.0, 15.0))
+            .collect();
+        let config = LayoutConfig::with_spacing(2.0, 2.0, 2.0);
+
+        let solution = layout_rows(&container, &elements, &config);
+        // 三角形顶部宽 100，底部趋近 0，至少应排放 ≥ 2 个
+        assert!(
+            solution.placed.len() >= 2,
+            "expected ≥2 placed in triangle, got {} placed",
+            solution.placed.len()
+        );
+        // 越靠下的元素 Y 越大
+        for w in solution.placed.windows(2) {
+            assert!(w[1].y >= w[0].y, "rows should go downward");
+        }
+    }
+
+    /// Bug 5 修复验证 —— 自定义 step_size 替换魔数 0.5
+    #[test]
+    fn test_step_size_custom() {
+        let container = square(0.0, 0.0, 100.0);
+        let elements = vec![LayoutElement::new("a", 40.0, 20.0)];
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.step_size = 0.5; // default
+        let sol_default = layout_rows(&container, &elements, &config);
+
+        config.step_size = 10.0;
+        let sol_big = layout_rows(&container, &elements, &config);
+
+        // 两种 step 都能正常排放（因为容器足够宽）
+        assert!(sol_default.is_fully_placed());
+        assert!(sol_big.is_fully_placed());
     }
 }

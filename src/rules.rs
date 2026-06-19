@@ -45,6 +45,9 @@ pub struct LayoutConfig {
     pub line_spacing: f64,
     /// 最小有效区间宽度（小于此宽度的区间被过滤）
     pub min_width: Option<f64>,
+    /// Y 轴扫描步长（用于跳过不可用区域，默认 0.5）
+    #[serde(default = "default_step_size")]
+    pub step_size: f64,
     /// 行内水平对齐
     #[serde(default)]
     pub halign: HAlign,
@@ -63,10 +66,15 @@ impl Default for LayoutConfig {
             gap: 0.0,
             line_spacing: 0.0,
             min_width: None,
+            step_size: 0.5,
             halign: HAlign::Left,
             valign: VAlign::Top,
         }
     }
+}
+
+fn default_step_size() -> f64 {
+    0.5
 }
 
 impl LayoutConfig {
