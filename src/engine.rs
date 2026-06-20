@@ -15,7 +15,7 @@ use kurbo::BezPath;
 use crate::element::LayoutElement;
 use crate::region::RangeGenerator;
 use crate::result::{LayoutSolution, LayoutWarning, PlacedElement};
-use crate::rules::{HAlign, LayoutConfig};
+use crate::rules::{HAlign, LayoutConfig, VAlign};
 
 /// 单次排版求解：在异形容器内按竖直流式排放矩形元素
 ///
@@ -113,32 +113,9 @@ pub fn layout_rows(
             pack_row_elements(elements, idx, interval_r - interval_l, config, &mut warnings);
 
         if row_indices.is_empty() {
-            // 连第一个元素都放不下
-            let elem = &elements[idx];
-            if elem.constraints.shrinkable {
-                if let Some(min_w) = elem.constraints.min_width {
-                    if min_w > interval_r - interval_l {
-                        warnings.push(LayoutWarning::ElementTooWide {
-                            element_id: elem.id.clone(),
-                            min_width: min_w,
-                            max_available: interval_r - interval_l,
-                        });
-                        unplaced.push(elem.id.clone());
-                        idx += 1;
-                        continue;
-                    }
-                }
-            } else {
-                // 不可缩且放不下 → 跳过
-                warnings.push(LayoutWarning::ElementTooWide {
-                    element_id: elem.id.clone(),
-                    min_width: elem.width,
-                    max_available: interval_r - interval_l,
-                });
-                unplaced.push(elem.id.clone());
-                idx += 1;
-                continue;
-            }
+            // 连第一个元素都放不下 → 用行高推进 Y（而非微小步长）
+            y += row_height.max(config.step_size);
+            continue;
         }
 
         idx = new_idx;
@@ -165,9 +142,9 @@ pub fn layout_rows(
                 .map(|&ri| {
                     let e = &elements[ri];
                     if e.constraints.shrinkable {
-                        e.constraints.min_width.unwrap_or(0.0)
+                        e.footprint_width_with(e.constraints.min_width.unwrap_or(0.0))
                     } else {
-                        e.width
+                        e.footprint_width()
                     }
                 })
                 .sum::<f64>()
@@ -177,6 +154,33 @@ pub fn layout_rows(
                 interval_l = widest.0 + config.padding_left;
                 interval_r = widest.1 - config.padding_right;
             }
+        }
+
+        // Bug B fix: 检查整行（含已打包元素）是否在容器底部以内
+        if y + row_height > max_y + 1e-9 {
+            // 已打包到行内的元素
+            for &ri in &row_indices {
+                warnings.push(LayoutWarning::Overflow {
+                    element_id: elements[ri].id.clone(),
+                    message: format!(
+                        "row exceeds container bottom: y={:.1} + row_height={:.1} > max_y={:.1}",
+                        y, row_height, max_y
+                    ),
+                });
+                unplaced.push(elements[ri].id.clone());
+            }
+            // 尚未处理的后缀元素
+            for i in idx..elements.len() {
+                warnings.push(LayoutWarning::Overflow {
+                    element_id: elements[i].id.clone(),
+                    message: format!(
+                        "row exceeds container bottom: y={:.1} + row_height={:.1} > max_y={:.1}",
+                        y, row_height, max_y
+                    ),
+                });
+                unplaced.push(elements[i].id.clone());
+            }
+            break;
         }
 
         // 5. kasuari 求解行内 X 位置
@@ -190,12 +194,26 @@ pub fn layout_rows(
             Ok(x_solutions) => {
                 for (elem_idx, resolved_x, resolved_width) in x_solutions {
                     let elem = &elements[elem_idx];
+
+                    // ── VAlign: 垂直对齐 + margin ──
+                    let viz_height = elem.height;
+                    let total_height = elem.footprint_height();
+                    let final_y = match config.valign {
+                        VAlign::Top => y + elem.margin.top,
+                        VAlign::Middle => {
+                            y + elem.margin.top + (row_height - total_height) / 2.0
+                        }
+                        VAlign::Bottom => {
+                            y + row_height - elem.margin.bottom - viz_height
+                        }
+                    };
+
                     placed.push(PlacedElement {
                         id: elem.id.clone(),
-                        x: resolved_x,
-                        y,
-                        width: resolved_width,
-                        height: elem.height,
+                        x: resolved_x + elem.margin.left,
+                        y: final_y,
+                        width: resolved_width - elem.margin.left - elem.margin.right,
+                        height: viz_height,
                     });
                 }
             }
@@ -234,7 +252,7 @@ fn pack_row_elements(
     start_idx: usize,
     available_width: f64,
     config: &LayoutConfig,
-    _warnings: &mut Vec<LayoutWarning>,
+    warnings: &mut Vec<LayoutWarning>,
 ) -> (Vec<usize>, usize, f64) {
     let mut row_indices: Vec<usize> = Vec::new();
     let mut used_width = 0.0;
@@ -244,35 +262,36 @@ fn pack_row_elements(
     while idx < elements.len() {
         let elem = &elements[idx];
 
-        // 尝试首选宽度
-        let preferred_w = elem.effective_width();
+        // 尝试首选宽度（含 margin 占地）
+        let footprint_w = elem.footprint_width();
         let gap_needed = if row_indices.is_empty() {
             0.0
         } else {
             config.gap
         };
 
-        let total_needed = used_width + gap_needed + preferred_w;
+        let total_needed = used_width + gap_needed + footprint_w;
 
         if total_needed <= available_width + 1e-9 {
             // 放得下
             row_indices.push(idx);
             used_width = total_needed;
-            row_height = row_height.max(elem.height);
+            row_height = row_height.max(elem.footprint_height());
             idx += 1;
         } else if elem.constraints.shrinkable {
-            // 尝试缩到最小宽度
+            // 尝试缩到最小宽度（含 margin）
             let min_w = elem
                 .constraints
                 .min_width
                 .unwrap_or(0.0)
                 .max(0.0);
-            let total_min = used_width + gap_needed + min_w;
+            let min_footprint = elem.footprint_width_with(min_w);
+            let total_min = used_width + gap_needed + min_footprint;
 
             if total_min <= available_width + 1e-9 {
                 row_indices.push(idx);
                 used_width = total_min;
-                row_height = row_height.max(elem.height);
+                row_height = row_height.max(elem.footprint_height());
                 idx += 1;
             } else {
                 // 哪怕最小宽度也放不下，这行到此为止
@@ -280,6 +299,15 @@ fn pack_row_elements(
             }
         } else {
             // 不可缩且放不下 → 行到此为止，下一个元素开新行
+            if row_indices.is_empty() {
+                // 单元素也放不下 → 记录警告
+                let occupied_span = elem.footprint_width();
+                warnings.push(LayoutWarning::ElementTooWide {
+                    element_id: elem.id.clone(),
+                    min_width: occupied_span,
+                    max_available: available_width,
+                });
+            }
             break;
         }
     }
@@ -332,12 +360,12 @@ fn solve_row_x(
             .map_err(|e| format!("add_constraint right<=R failed: {e:?}"))?;
     }
 
-    // ── 宽度约束 ──
+    // ── 宽度约束（含 margin 占地）──
     for i in 0..n {
         let elem = &elements[row_indices[i]];
-        let preferred_w = elem.effective_width();
+        let footprint_w = elem.footprint_width();
 
-        // right_i - left_i == preferred_width
+        // right_i - left_i == footprint_width
         // 不可缩元素用 REQUIRED（硬锁，宁愿求解失败也不允许被压扁）
         // 可缩元素用 STRONG（边界约束为 REQUIRED 时 kasuari 会自动缩短）
         let width_strength = if elem.constraints.shrinkable {
@@ -347,33 +375,36 @@ fn solve_row_x(
         };
         solver
             .add_constraints(
-                [(right_vars[i] - left_vars[i]) | EQ(width_strength) | preferred_w],
+                [(right_vars[i] - left_vars[i]) | EQ(width_strength) | footprint_w],
             )
             .map_err(|e| format!("add_constraint width==preferred failed: {e:?}"))?;
 
-        // min_width 约束
+        // min_width 约束（含 margin）
         if let Some(min_w) = elem.constraints.min_width {
-            if min_w > 0.0 {
+            let min_footprint = elem.footprint_width_with(min_w);
+            if min_footprint > 0.0 {
                 solver
                     .add_constraints(
-                        [(right_vars[i] - left_vars[i]) | GE(Strength::REQUIRED) | min_w],
+                        [(right_vars[i] - left_vars[i]) | GE(Strength::REQUIRED) | min_footprint],
                     )
                     .map_err(|e| format!("add_constraint width>=min failed: {e:?}"))?;
             }
         }
 
-        // max_width 约束
+        // max_width 约束（含 margin）
         if let Some(max_w) = elem.constraints.max_width {
+            let max_footprint = elem.footprint_width_with(max_w);
             solver
                 .add_constraints(
-                    [(right_vars[i] - left_vars[i]) | LE(Strength::REQUIRED) | max_w],
+                    [(right_vars[i] - left_vars[i]) | LE(Strength::REQUIRED) | max_footprint],
                 )
                 .map_err(|e| format!("add_constraint width<=max failed: {e:?}"))?;
         }
     }
 
     // ── 间距约束：left_{i+1} >= right_i + gap ──
-    if n > 1 && config.gap > 0.0 {
+    // margin 已纳入 footprint 宽度，gap 直接叠加即可
+    if n > 1 {
         for i in 0..(n - 1) {
             solver
                 .add_constraints(
@@ -399,12 +430,13 @@ fn solve_row_x(
                 .map_err(|e| format!("add_constraint align-right failed: {e:?}"))?;
         }
         HAlign::Center => {
-            // left_0 + right_last == interval_l + interval_r (等边距)
+            // 真正的居中：元素组的几何中心 == 区间中心
             let last = n - 1;
-            let target = interval_l + interval_r;
+            let total_width = right_vars[last] - left_vars[0];
+            let center = (interval_l + interval_r) / 2.0;
             solver
                 .add_constraints(
-                    [(left_vars[0] + right_vars[last]) | EQ(Strength::STRONG) | target],
+                    [(left_vars[0] + total_width / 2.0) | EQ(Strength::STRONG) | center],
                 )
                 .map_err(|e| format!("add_constraint align-center failed: {e:?}"))?;
         }
@@ -430,6 +462,7 @@ fn solve_row_x(
 mod tests {
     use super::*;
     use crate::element::LayoutElement;
+    use crate::ElementMargin;
 
     fn square(x: f64, y: f64, size: f64) -> BezPath {
         let mut p = BezPath::new();
@@ -663,5 +696,220 @@ mod tests {
         // 两种 step 都能正常排放（因为容器足够宽）
         assert!(sol_default.is_fully_placed());
         assert!(sol_big.is_fully_placed());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 1.5 新功能测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// VAlign::Middle —— 行内矮元素垂直居中
+    #[test]
+    fn test_valign_middle() {
+        let container = square(0.0, 0.0, 200.0);
+        let elements = vec![
+            LayoutElement::new("tall", 30.0, 50.0),  // 行内最高
+            LayoutElement::new("short", 30.0, 10.0), // 应该垂直居中
+        ];
+        let mut config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        config.valign = VAlign::Middle;
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(solution.is_fully_placed());
+
+        // tall 元素：高度等于行高，y 不变
+        let tall = &solution.placed[0];
+        assert!((tall.y - 5.0).abs() < 1.0, "tall y should ≈5");
+
+        // short 元素：居中 y = 5 + (50-10)/2 = 25
+        let short = &solution.placed[1];
+        assert!(
+            (short.y - 25.0).abs() < 1.0,
+            "short valign=middle y should ≈25, got {}",
+            short.y
+        );
+    }
+
+    /// VAlign::Bottom —— 行内矮元素贴底
+    #[test]
+    fn test_valign_bottom() {
+        let container = square(0.0, 0.0, 200.0);
+        let elements = vec![
+            LayoutElement::new("tall", 30.0, 50.0),
+            LayoutElement::new("short", 30.0, 10.0),
+        ];
+        let mut config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        config.valign = VAlign::Bottom;
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(solution.is_fully_placed());
+
+        let short = &solution.placed[1];
+        // bottom: y = 5 + 50 - 10 = 45
+        assert!(
+            (short.y - 45.0).abs() < 1.0,
+            "short valign=bottom y should ≈45, got {}",
+            short.y
+        );
+    }
+
+    /// VAlign::Top 是默认，不需要特殊处理
+    #[test]
+    fn test_valign_top_default() {
+        let container = square(0.0, 0.0, 200.0);
+        let elements = vec![
+            LayoutElement::new("tall", 30.0, 50.0),
+            LayoutElement::new("short", 30.0, 10.0),
+        ];
+        let config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(solution.is_fully_placed());
+
+        let short = &solution.placed[1];
+        assert!((short.y - 5.0).abs() < 1.0, "short valign=top y should ≈5");
+    }
+
+    /// 元素 Margin —— 水平 margin 增加占地面积
+    #[test]
+    fn test_element_margin_horizontal() {
+        let container = square(0.0, 0.0, 100.0);
+        let elements = vec![
+            LayoutElement::with_margin(
+                "a", 30.0, 20.0,
+                ElementMargin::horizontal(5.0),
+            ),
+            LayoutElement::new("b", 20.0, 20.0),
+        ];
+        // a 的占地 = 5 + 30 + 5 = 40
+        // b 的占地 = 20
+        // 可用宽度 = 100 - 5*2 = 90, gap = 2
+        // 40 + 2 + 20 = 62 ≤ 90 → 同行
+        let config = LayoutConfig::with_spacing(5.0, 2.0, 5.0);
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "warnings: {:?}",
+            solution.warnings
+        );
+        assert_eq!(solution.placed.len(), 2);
+
+        // a 的视觉 x 应该 = padding_left + margin.left = 5 + 5 = 10
+        let a = &solution.placed[0];
+        assert!(
+            (a.x - 10.0).abs() < 1.0,
+            "a x should ≈10 (padding + margin_left), got {}",
+            a.x
+        );
+        // a 的 visual width = 30 (不含 margin)
+        assert!(
+            (a.width - 30.0).abs() < 1.0,
+            "a width should ≈30, got {}",
+            a.width
+        );
+    }
+
+    /// 元素 Margin —— 垂直 margin 影响行高和 VAlign
+    #[test]
+    fn test_element_margin_vertical_valign() {
+        let container = square(0.0, 0.0, 200.0);
+        let elements = vec![
+            LayoutElement::new("plain", 30.0, 20.0),
+            LayoutElement::with_margin(
+                "margined",
+                30.0,
+                10.0,
+                ElementMargin {
+                    left: 0.0,
+                    right: 0.0,
+                    top: 5.0,
+                    bottom: 5.0,
+                },
+            ),
+        ];
+        let mut config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        config.valign = VAlign::Middle;
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(solution.is_fully_placed());
+
+        // row_height = max(20, 5+10+5) = 20 (plain 更高)
+        // margined element Middle: y + margin.top + (row_height - footprint_height) / 2
+        //   = 5 + 5 + (20 - 20) / 2 = 10
+        let margined = &solution.placed[1];
+        assert!(
+            (margined.y - 10.0).abs() < 1.0,
+            "margined middle y should ≈10, got {}",
+            margined.y
+        );
+    }
+
+    /// Bug B 修复 —— 行高超过容器底部时整行溢出
+    #[test]
+    fn test_row_exceeds_container_bottom() {
+        // 容器 200x30，padding 5/5 → 可用高度 20
+        let mut container = BezPath::new();
+        container.move_to((0.0, 0.0));
+        container.line_to((200.0, 0.0));
+        container.line_to((200.0, 30.0));
+        container.line_to((0.0, 30.0));
+        container.close_path();
+
+        // 元素高 25，加上 padding 5*2 = 10，一行就超过容器底部
+        let elements = vec![
+            LayoutElement::new("too_tall", 30.0, 25.0),
+            LayoutElement::new("next", 30.0, 10.0),
+        ];
+        let config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        // y=5, row_height=25 → y+row_height=30, max_y=25 → overflow
+        // 两个元素都应 unplaced
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(!solution.is_fully_placed());
+        assert_eq!(solution.unplaced.len(), 2);
+        // 应该有 Overflow 警告
+        assert!(solution
+            .warnings
+            .iter()
+            .any(|w| matches!(w, LayoutWarning::Overflow { .. })));
+    }
+
+    /// Bug B 修复 —— 刚好贴底的行可以排放
+    #[test]
+    fn test_row_exactly_fits_bottom() {
+        // 容器 200x30，padding 5/5 → max_y=25
+        let mut container = BezPath::new();
+        container.move_to((0.0, 0.0));
+        container.line_to((200.0, 0.0));
+        container.line_to((200.0, 30.0));
+        container.line_to((0.0, 30.0));
+        container.close_path();
+
+        let elements = vec![LayoutElement::new("fits", 30.0, 20.0)];
+        let config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        // y=5, row_height=20 → y+row_height=25 = max_y → 恰好贴底，应排放
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "should fit exactly at bottom"
+        );
+    }
+
+    /// Margin 导致单元素过宽
+    #[test]
+    fn test_margin_causes_overflow() {
+        let container = square(0.0, 0.0, 50.0);
+        let elements = vec![LayoutElement::with_margin(
+            "wide",
+            40.0,
+            20.0,
+            ElementMargin::horizontal(10.0),
+        )];
+        // footprint = 10 + 40 + 10 = 60 > 50 - 2*5 = 40 → 放不下
+        let config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(!solution.is_fully_placed());
     }
 }

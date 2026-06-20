@@ -46,6 +46,7 @@ pub mod result;
 pub mod rules;
 
 // ── 重导出（方便外部使用） ──
+pub use element::ElementMargin;
 pub use element::LayoutElement;
 pub use engine::layout_rows;
 pub use region::RangeGenerator;
