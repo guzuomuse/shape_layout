@@ -9,3 +9,7 @@ kurbo = { workspace = true }
 i_overlay = { workspace = true }
 kasuari = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+bevy = { workspace = true }
+rand = { workspace = true }

@@ -343,6 +343,15 @@ impl RangeGenerator {
         final_intervals.retain(|(l, r)| (r - l) >= min_width);
         final_intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // 调试日志：记录靠近心形右尖的行级别区间
+        const HEART_RIGHT_TIP_X: f64 = 200.0;
+        if final_intervals.iter().any(|(_, r)| *r > HEART_RIGHT_TIP_X) {
+            println!(
+                "[row_interval] y_start={:.3} height={:.3} intervals={:?}",
+                y_start, height, final_intervals,
+            );
+        }
+
         RowRange {
             y_start,
             height,
@@ -356,48 +365,65 @@ impl RangeGenerator {
 
     /// 从扁平化的 AND 结果多边形中找出 X 轴瓶颈区间 `[safe_left, safe_right]`
     ///
-    /// 算法：
-    /// - 确保多边形为 CCW 方向
-    /// - 向下走的边（dy < 0）是"左墙" → 取 max_x 作为 safe_left
-    /// - 向上走的边（dy > 0）是"右墙" → 取 min_x 作为 safe_right
-    /// - 水平边忽略
+    /// 使用边缘方向分类法：对 CCW 多边形，
+    /// - 向下走的边（dy < 0）是左墙，取 `max_x` 收紧左边界
+    /// - 向上走的边（dy > 0）是右墙，取 `min_x` 收紧右边界
+    ///
+    /// 对凸/凹多边形均数学上正确，不依赖采样密度。
     fn find_bottleneck(contour: &[SPoint]) -> Option<(f64, f64)> {
         if contour.len() < 3 {
             return None;
         }
 
-        // 确保 CCW 方向
-        let contour = if signed_area(contour) < 0.0 {
+        // 确保 CCW（边缘方向分类法的前提）
+        let area = signed_area(contour);
+        let working = if area < 0.0 {
             let mut reversed = contour.to_vec();
             reversed.reverse();
             reversed
         } else {
             contour.to_vec()
         };
+        let n = working.len();
 
-        let mut safe_left = f64::MIN;
-        let mut safe_right = f64::MAX;
+        let mut safe_left = f64::NEG_INFINITY;
+        let mut safe_right = f64::INFINITY;
 
-        let n = contour.len();
         for i in 0..n {
-            let v1 = &contour[i];
-            let v2 = &contour[(i + 1) % n];
+            let v1 = &working[i];
+            let v2 = &working[(i + 1) % n];
 
             let dy = v2.y - v1.y;
             if dy.abs() < Self::EPSILON {
-                continue; // 忽略水平边
+                continue; // 水平边不参与分类
             }
 
+            // 等效于 cavalier_contours::seg_bounding_box(v1, v2)
+            // ioverlay 产出的全部是直线段，所以直接用端点 X 范围即可
+            let seg_min_x = v1.x.min(v2.x);
+            let seg_max_x = v1.x.max(v2.x);
+
             if dy < 0.0 {
-                // 左墙：向下走，内部在右侧 → 瓶颈取该段最右 X
-                safe_left = safe_left.max(v1.x.max(v2.x));
+                // 左墙：向下走 → 取该段最右点作为安全左边界
+                safe_left = safe_left.max(seg_max_x);
             } else {
-                // 右墙：向上走，内部在左侧 → 瓶颈取该段最左 X
-                safe_right = safe_right.min(v1.x.min(v2.x));
+                // 右墙：向上走 → 取该段最左点作为安全右边界
+                safe_right = safe_right.min(seg_min_x);
             }
         }
 
         if safe_right > safe_left + Self::EPSILON {
+            // 调试日志：记录靠近心形右尖的瓶颈区间
+            const HEART_RIGHT_TIP_X: f64 = 200.0;
+            if safe_right > HEART_RIGHT_TIP_X {
+                let aabb = contour_aabb(&working);
+                println!(
+                    "[bottleneck] method=edge_dir safe=({:.3}, {:.3}) width={:.3} | contour_bbox=({:.3}, {:.3}, {:.3}, {:.3}) vertices={}",
+                    safe_left, safe_right, safe_right - safe_left,
+                    aabb.x0, aabb.y0, aabb.x1, aabb.y1,
+                    working.len(),
+                );
+            }
             Some((safe_left, safe_right))
         } else {
             None

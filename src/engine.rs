@@ -51,6 +51,15 @@ pub fn layout_rows(
         None => return LayoutSolution::invalid_container(elements),
     };
 
+    // 调试心跳：每次排版都打印容器范围
+    println!(
+        "[layout_rows] START | container_bbox=({:.1},{:.1}→{:.1},{:.1}) | elements={} | padding=(l:{},r:{},t:{},b:{})",
+        rg.extents.x0, rg.extents.y0, rg.extents.x1, rg.extents.y1,
+        elements.len(),
+        config.padding_left, config.padding_right,
+        config.padding_top, config.padding_bottom,
+    );
+
     let max_y = rg.extents.y1 - config.padding_bottom;
     let container_y0 = rg.extents.y0;
     let mut placed: Vec<PlacedElement> = Vec::new();
@@ -206,8 +215,26 @@ pub fn layout_rows(
             interval_l,
             interval_r,
             config,
+            &mut warnings,
         ) {
             Ok(x_solutions) => {
+                // 调试日志：对靠近心形右尖的 Fill 元素记录求解细节
+                const HEART_RIGHT_TIP_X: f64 = 200.0;
+                for &(elem_idx, resolved_x, resolved_width) in &x_solutions {
+                    let elem = &elements[elem_idx];
+                    let right_edge = resolved_x + resolved_width;
+                    if matches!(elem.constraints.size_strategy, SizeStrategy::Fill)
+                        && right_edge > HEART_RIGHT_TIP_X - 50.0
+                    {
+                        println!(
+                            "[fill_placed] id='{}' x={:.3} width={:.3} right_edge={:.3} | interval=({:.3}, {:.3}) interval_width={:.3} | row_y={:.3} row_h={:.3}",
+                            elem.id, resolved_x, resolved_width, right_edge,
+                            interval_l, interval_r, interval_r - interval_l,
+                            y, row_height,
+                        );
+                    }
+                }
+
                 for (elem_idx, resolved_x, resolved_width) in x_solutions {
                     let elem = &elements[elem_idx];
 
@@ -260,6 +287,13 @@ pub fn layout_rows(
 
         y += row_height + config.line_spacing;
     }
+
+    println!(
+        "[layout_rows] DONE | placed={} unplaced={} warnings={}",
+        placed.len(),
+        unplaced.len(),
+        warnings.len(),
+    );
 
     LayoutSolution {
         placed,
@@ -369,6 +403,7 @@ fn solve_row_x(
     interval_l: f64,
     interval_r: f64,
     config: &LayoutConfig,
+    warnings: &mut Vec<LayoutWarning>,
 ) -> Result<Vec<(usize, f64, f64)>, String> {
     let n = row_indices.len();
     if n == 0 {
@@ -540,6 +575,77 @@ fn solve_row_x(
         let right = solver.get_value(right_vars[i]);
         let width = right - left;
         results.push((row_indices[i], left, width.max(0.0)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 安全兜底网：钳制 + 重排，数学保证绝不越界、绝不重叠
+    // ═══════════════════════════════════════════════════════════════════════
+    let mut any_clamped = false;
+
+    // 步骤1：逐个钳制到区间边界 [interval_l, interval_r]
+    for (_, left, width) in results.iter_mut() {
+        let raw_left = *left;
+        let raw_right = *left + *width;
+        *left = raw_left.max(interval_l).min(interval_r);
+        let clamped_right = raw_right.max(interval_l).min(interval_r);
+        if clamped_right < *left {
+            // 整个元素在区间外 → 零宽度放到左边界
+            *left = interval_l;
+            *width = 0.0;
+        } else {
+            *width = clamped_right - *left;
+        }
+        if (raw_left - *left).abs() > 1e-9 || (raw_right - clamped_right).abs() > 1e-9 {
+            any_clamped = true;
+        }
+    }
+
+    // 步骤2：从左到右确保间距 ≥ config.gap（不超出 interval_r）
+    if n > 1 {
+        for i in 1..n {
+            let prev_right = results[i - 1].1 + results[i - 1].2;
+            let min_left = (prev_right + config.gap).min(interval_r);
+            if results[i].1 < min_left {
+                results[i].1 = min_left;
+                let max_right = (results[i].1 + results[i].2).min(interval_r);
+                results[i].2 = (max_right - results[i].1).max(0.0);
+                any_clamped = true;
+            }
+        }
+    }
+
+    // 步骤3：右侧边界兜底 + 从右向左回溯压缩（保证最后一个元素不越界）
+    if n > 0 {
+        let last = n - 1;
+        let right = results[last].1 + results[last].2;
+        if right > interval_r + 1e-9 {
+            // 压缩最后一个元素
+            results[last].1 = results[last].1.min(interval_r);
+            results[last].2 = (interval_r - results[last].1).max(0.0);
+            any_clamped = true;
+            // 从右向左回溯：前一个元素的右边界不能超过后一个元素的左边界 - gap
+            for i in (0..last).rev() {
+                let next_left = results[i + 1].1;
+                let max_right = (next_left - config.gap).max(interval_l);
+                let cur_right = results[i].1 + results[i].2;
+                if cur_right > max_right + 1e-9 {
+                    if max_right < results[i].1 {
+                        results[i].1 = max_right;
+                        results[i].2 = 0.0;
+                    } else {
+                        results[i].2 = max_right - results[i].1;
+                    }
+                    any_clamped = true;
+                }
+            }
+        }
+    }
+
+    if any_clamped {
+        warnings.push(LayoutWarning::ConstraintConflict(format!(
+            "safety net: solver produced out-of-bounds positions; clamped row to interval [{:.3}, {:.3}]",
+            interval_l, interval_r
+        )));
     }
 
     Ok(results)
