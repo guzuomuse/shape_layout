@@ -1018,3 +1018,293 @@ API 设计 ⭐⭐⭐⭐⭐
 
 需要我帮你把 “正确行高 + Stretch 约束 + Baseline margin” 的伪代码直接写出来吗？  
 你直接让 AI 助手照着改就行。
+
+
+# -----------针对以上搜集的内容，我的Ai编程助手给出的回复如下----------------------------------------------------------------- #
+
+
+## 📋 7 份审查意见逐条分析
+
+### 审查者 1（"悬空间距 Bug"）
+
+**核心指控**：`[Fill, Fixed]` 排列时，Fill 元素不在末尾，gap 约束只有 `>=`（REQUIRED）没有 `==`（STRONG），导致 Fill 宽度自由度悬空。
+Let me verify the bug: the "Fill紧跟前驱约束" only fires when `can_stretch()` is true for the CURRENT element (the one after the gap). This means in a [Fill, Fixed] row:
+- i=0: no predecessor check (loop starts at 1)
+- i=1: Fixed doesn't satisfy `can_stretch()`, so gap between them NOT locked
+
+So the gap between Fill (index 0) and Fixed (index 1) has only `GE(REQUIRED) | gap`, not `EQ(STRONG)`. With row-fill STRONG forcing total width = interval_width, the solver can make the Fill element narrow and the gap wide.
+
+This IS a real bug. Let me confirm by also checking our test coverage - we need to write a test for [Fill, Fixed] ordering.
+让我精确验证这个漏洞。当前 "Fill紧跟前驱约束" 的触发条件是：**只有后一个元素是 Fill 时** 才锁 gap。
+
+```
+场景 [Fill, Fixed]：→ Fixed 不满足 can_stretch() → gap 未锁！
+场景 [Fill, Fill]： → 第二个 Fill 满足 can_stretch() → gap 已锁 ✓
+场景 [Fixed, Fill]：→ Fill 满足 can_stretch() → gap 已锁 ✓ （我们的测试都覆盖了这种）
+```
+
+**结论：这是一个真 Bug。** 我们的测试 `test_fill_absorbs_remainder` 和 `test_shrinkable_fixed_with_fill` 恰巧把 Fill 放到了 Fixed 后面，避开了这个漏洞。
+
+---
+
+**修复方案正确性评估**：审查者 1 建议的修复——让**所有**相邻 gap 都锁 `EQ(STRONG) | gap`——是正确的。这比我们当前"只锁 Fill 前驱"的逻辑更干净、更全面。实施后，`[Fill, Fixed]` 场景中 Fixed 前的 gap 会被锁定，row-fill STRONG 约束会把剩余空间推入 Fill 的宽度（因为 gap 已经不能膨胀了）。
+
+但审查者 1 说"只需要改 gap 锁，不需要删 GE 约束"——这也是对的，`GE(REQUIRED)` 保底 + `EQ(STRONG)` 偏好是经典的 kasuari 双约束模式。
+
+---
+
+### 审查者 2（"多区间 + step_size + Feature 建议"）
+
+- **"step_size 死循环"**——真担心但非 Bug，是优化建议。当前 `step_size` 默认 0.5，用户可以调大。
+- **"多区间并行"**——真缺陷但非 Bug。心形顶部左右两心房确实只用了一个最宽区间。但这是 Phase 3 的功能级别问题，不是代码错误。
+- **其余建议**（Padding、截断、相对约束）都是 Feature Request。
+
+**结论：没有报告 Bug，都是功能建议。大部分建议合理但属于后续阶段。**
+
+---
+
+### 审查者 3（"used_width 累加逻辑有 Bug"）
+
+**这个指控是错误的。** 让我们追踪 `pack_row_elements` 的 `used_width` 累加：
+
+```
+元素 0: gap_needed=0,  total_needed=0+0+fp_0,       used_width=fp_0
+元素 1: gap_needed=gap, total_needed=fp_0+gap+fp_1,   used_width=fp_0+gap+fp_1
+元素 2: gap_needed=gap, total_needed=fp_0+gap+fp_1+gap+fp_2
+```
+
+这正是正确的**累计占用宽度**：`used_width` 代表从第一个元素左边缘到最后一个元素右边缘的总宽度（含所有 gap）。每次新元素加入，gap 只加一次，不存在"重复计算"。
+
+```155:173:d:\www\bevy_projects\pce\crates\shape_layout\src\engine.rs
+        // 校验 refinement 后的区间仍能容纳行内元素（防止沙漏形容器因行高增大
+        // 导致区间缩水到放不下已打包元素，退回原始区间）
+        if !row_indices.is_empty() {
+            let row_min_span: f64 = row_indices
+                .iter()
+                .map(|&ri| {
+                    let e = &elements[ri];
+                    if e.constraints.size_strategy.can_shrink() {
+                        e.footprint_width_with(e.constraints.min_width.unwrap_or(0.0))
+                    } else {
+                        e.footprint_width()
+                    }
+                })
+                .sum::<f64>()
+                + (row_indices.len().saturating_sub(1)) as f64 * config.gap;
+            if interval_r - interval_l < row_min_span - 1e-9 {
+```
+
+注意第 167 行——这里**独立重算** `row_min_span` 用的是 `sum(footprints) + (n-1)*gap`，跟 `pack_row_elements` 的 `used_width` 走不同代码路径，两者互相印证。如果 `used_width` 真的重复累加 gap，那么 `row_min_span` 就会跟它不一致，bug 早就暴露了。
+
+**结论：审查者 3 的这一指控不成立。**
+
+---
+
+### 审查者 4（平衡型审阅）
+
+- 对 `row-fill` STRONG 强度的分析**正确**——承认它会与 HAlign 在 max_width 场景做最小二乘平衡，这个设计是自洽的。
+- 对 `pack_row_elements` 中 min_width 建议使用 `footprint_width_with`——当前代码**已经**使用了 `footprint_width_with(min_w)`（见第 316 行），此建议已满足。
+- 其余建议都很朴素。
+
+**结论：审阅质量最高的一份，实事求是，不夸张。没有发现真实 Bug。**
+
+---
+
+### 审查者 5（"结构性缺陷"三 Bug）
+
+#### 声称 Bug 1：Fill 需要 WEAK 宽度约束
+
+这是争议最大的点。我们在实现过程中**确实尝试过 WEAK 约束**，然后发现 kasuari 会通过"推位置"而非"拉伸宽度"来满足 WEAK——这就是当时测试失败的原因。
+
+审查者 5 认为加 WEAK 约束就能工作，但他**没有考虑**如果 gap 没锁、kasuari 会优先推位置而不是拉伸宽度。他的分析是对的——如果 gap 都锁了，WEAK 宽度 + STRONG row-fill 确实会产生正确的拉伸行为——但前提是 gap 锁已经修复。
+
+**我们的做法（无宽度约束 + gap 锁）同样正确且更简洁**：Fill 不需要宽度偏好约束，因为 Solved 自由变量在 gap 被锁 + row-fill 约束的推动下自然会取到正确的宽度。
+
+**结论：不是 Bug。这是两种等效解法，我们的更简单。**
+
+#### 声称 Bug 2：删除"Fill紧跟前驱"
+
+这个跟审查者 1 的发现一致。修复方向是对的：把"只锁 Fill 前驱"改为"锁所有 gap"。但这个建议和 Bug 1 的建议之间有冲突——如果 gap 全锁了，那"Fill紧跟前驱"确实是冗余的。
+
+**结论：方向正确但措辞过激。不是"删除"，是"扩展为所有 gap 全锁"。**
+
+#### 声称 Bug 3：row-fill 从 STRONG 改为 MEDIUM
+
+审查者 5 认为当 `max_width` 阻止 Fill 填满时，STRONG row-fill 和 STRONG HAlign 会产生折中状态。
+
+这个分析**理论正确但过度设计**。在当前约束体系中：
+- REQUIRED max_width 会首先满足
+- 然后 kasuari 在 STRONG 约束之间做最小二乘平衡
+
+实际行为是：Fill 被 max_width 截断后，HAlign 仍能大致生效。将 row-fill 降到 MEDIUM 的风险是：在**正常** Fill 场景（无 max_width），MEDIUM 可能弱于其他 MEDIUM 级别的约束（如果有的话），导致 Fill 不完全填满。
+
+**结论：不是 Bug。当前 STRONG 设计在实践中表现良好，测试也通过了。**
+
+---
+
+### 审查者 6（"数值稳定性"两 Bug）
+
+#### 声称 Bug A：interval_width 可能为负
+
+```106:109:d:\www\bevy_projects\pce\crates\shape_layout\src\engine.rs
+        // 边界保护
+        if interval_r - interval_l <= 0.0 {
+            y += config.step_size;
+            continue;
+        }
+```
+
+**已经处理了。** 这人在 `solve_row_x` 里找 `interval_width`，但没注意到它在 `layout_rows` 里已经经过了两层保护：`padding` 减法和 `<= 0.0` 检查。
+
+#### 声称 Bug B：行高公式错误
+
+```127:138:d:\www\bevy_projects\pce\crates\shape_layout\src\engine.rs
+        if config.valign == VAlign::Baseline {
+            let mut max_ascent = 0.0_f64;
+            let mut max_descent = 0.0_f64;
+            for &ri in &row_indices {
+                let elem = &elements[ri];
+                let elem_baseline = elem.effective_baseline();
+                let ascent = elem_baseline + elem.margin.top;
+                let descent = (elem.height - elem_baseline).max(0.0) + elem.margin.bottom;
+                max_ascent = max_ascent.max(ascent);
+                max_descent = max_descent.max(descent);
+            }
+            row_height = max_ascent + max_descent;
+        }
+```
+
+**行高公式已经是对的！** `row_height = max(baseline + margin.top) + max((height - baseline) + margin.bottom)`。这正是他声称"缺失"的公式。
+
+- 声称 "y + row_height > max_y 检查缺失"——第 176 行已经存在。
+- 声称 `interval_width = interval.1 - interval.0` 缺少 `.max(1e-6)`——这个保护可以从 `solve_row_x` 提升到 `layout_rows` 的入口处，但 `layout_rows` 已有 `interval_r - interval_l <= 0.0` 的保护。
+
+**结论：审查者 6 没有认真读代码。三个"Bug"中有两个已经在代码中存在，一个（interval_width 保护）是合理的防御性编程建议但非 Bug。**
+
+---
+
+### 审查者 7（"正确公式在代码里没完全落地"）
+
+| 指控 | 实际情况 |
+|:---|:---|
+| 行高用的 `max(e.height + margin)` 非基线公式 | **错**——Baseline 模式下第 125-138 行明确用了 `max_ascent + max_descent` 公式 |
+| Stretch 缺 STRONG fill 约束 | **错**——第 510-517 行 `right_last - left_0 == interval_width (STRONG)` |
+| Baseline 对齐缺 margin_top | **错**——第 234-235 行：`y + max_ascent - elem_baseline - elem.margin.top`，其中 `max_ascent` 已包含 `margin.top` |
+| 缺行溢出保护 | **错**——第 176-200 行已有完整检测 |
+
+**结论：审查者 7 的指责全部不成立。我们的代码已经实现了所有他声称"缺失"的功能。**
+
+---
+
+## 🎯 汇总：真实 Bug vs 误报
+
+| # | 审查者 | 指控 | 判定 |
+|:--|:------|:-----|:-----|
+| 1 | 审查者 1 | gap 锁不完整：`[Fill, Fixed]` 排列时 Fill 宽度自由度悬空 | ✅ **真 Bug** |
+| 2 | 审查者 3 | `used_width` 重复累加 gap | ❌ 误报 |
+| 3 | 审查者 5 | Fill 需要 WEAK 宽度约束 | ❌ 非 Bug（等效替代方案） |
+| 4 | 审查者 5 | 删除"Fill紧跟前驱" | 🟡 方向对但措辞偏激（应扩展而非删除） |
+| 5 | 审查者 5 | row-fill 改 MEDIUM | ❌ 非 Bug（STRONG 在实践中正确） |
+| 6 | 审查者 6 | interval_width 可能为负 | ❌ 误报（已保护） |
+| 7 | 审查者 6 | 行高公式错误 | ❌ 误报（已正确） |
+| 8 | 审查者 6 | y+row_height > max_y 检查缺失 | ❌ 误报（已存在） |
+| 9 | 审查者 7 | 全部四个"缺失功能"指责 | ❌ 均为误报（代码中已实现） |
+
+**7 位审查者，只找到 1 个真 Bug。**
+
+---
+
+## 🔧 真 Bug 详解与修复方案
+
+### Bug：`[Fill, Fixed]` 排列时 gap 不全锁导致 Fill 宽度自由度悬空
+
+**触发条件**：`SizeStrategy::Fill` 元素不在行尾，后面跟着 `Fixed` 元素。
+
+**根因**：当前 "Fill紧跟前驱约束" 只检查**后一个**元素是不是 Fill：
+
+```489:505:d:\www\bevy_projects\pce\crates\shape_layout\src\engine.rs
+    // ── Fill 元素紧跟前驱约束 ──
+    // 当元素是 FIll 时，偏好前驱 gap 精确贴合（STRONG），
+    // 配合 row-fill 将剩余空间推入 Fill 元素的宽度。
+    if has_fill_in_row && n > 1 {
+        for i in 1..n {
+            let elem = &elements[row_indices[i]];
+            if elem.constraints.size_strategy.can_stretch() {
+                solver
+                    .add_constraints(
+                        [(left_vars[i] - right_vars[i - 1])
+                            | EQ(Strength::STRONG)
+                            | config.gap],
+                    )
+                    .map_err(|e| format!("add_constraint fill-gap-adjacent failed: {e:?}"))?;
+            }
+        }
+    }
+```
+
+**修复**：将条件从 `can_stretch()`（仅 Fill 元素）扩展为**所有相邻元素对**都锁 gap。这样无论 Fill 在哪个位置，其相邻 gap 都是锁死的，row-fill STRONG 约束会自然把空间推入 Fill 宽度。
+
+```rust
+// ── 间距约束（修正后）：所有相邻元素之间的 gap 全部锁死 ──
+if n > 1 {
+    for i in 0..(n - 1) {
+        // 1. 硬底线：gap 不能小于 config.gap（REQUIRED）
+        solver
+            .add_constraints(
+                [(left_vars[i + 1] - right_vars[i]) | GE(Strength::REQUIRED) | config.gap],
+            )
+            .map_err(|e| format!("add_constraint gap>=min failed: {e:?}"))?;
+        
+        // 2. 偏好：gap 精确等于 config.gap（STRONG）
+        //    确保所有"拉伸力"被推入 Fill 元素的宽度，而非膨胀间距
+        solver
+            .add_constraints(
+                [(left_vars[i + 1] - right_vars[i]) | EQ(Strength::STRONG) | config.gap],
+            )
+            .map_err(|e| format!("add_constraint gap==exact failed: {e:?}"))?;
+    }
+}
+```
+
+然后删除现有的 `Fill 元素紧跟前驱约束` 代码块（第 489-505 行），因为它已被上面更全面的逻辑覆盖。
+
+**验证测试**（需要新增）：
+
+```rust
+/// [Fill, Fixed] 排列：验证 Fill 在 Fixed 前面时仍然正确拉伸
+#[test]
+fn test_fill_before_fixed() {
+    let container = square(0.0, 0.0, 200.0);
+    let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+    fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+    let fixed_elem = LayoutElement::new("fixed", 40.0, 20.0);
+    
+    let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+    // 区间 = 190, Fixed 占 40, gap=5, Fill 应占 190-40-5=145
+    
+    let solution = layout_rows(&container, &[fill_elem, fixed_elem], &config);
+    assert!(solution.is_fully_placed());
+    let fill = &solution.placed[0];
+    let fixed = &solution.placed[1];
+    
+    // Fixed 保持在 40
+    assert!((fixed.width - 40.0).abs() < 1.0);
+    // Fill 吸收了剩余空间
+    assert!(fill.width > 40.0, "Fill should absorb space, got {}", fill.width);
+    // gap = fill.right 到 fixed.left
+    let gap = fixed.x - (fill.x + fill.width);
+    assert!((gap - 5.0).abs() < 1.0, "gap should be ~5, got {}", gap);
+}
+```
+
+---
+
+## 📊 总结
+
+1. **真 Bug 数量：1 个**——`[Fill, Fixed]` 排列的 gap 不全锁
+2. **误报数量：8 个**——大部分是没仔细读代码就下的结论
+3. **有用 Feature 建议：多个**——SpaceBetween、多区间并行、Padding、Text Wrap 等——但这些是 Phase 3 的内容，不是当前代码的缺陷
+
+大哥，这 7 份审查意见质量参差不齐，但**审查者 1 确实帮我们找到了一个真实的结构性缺陷**。修复也很简单，就是改 gap 约束的作用范围。
+
+要我立即执行这个修复（改 gap 锁 + 新增测试 + cargo test 验证）吗？
