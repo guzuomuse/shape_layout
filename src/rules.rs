@@ -14,7 +14,7 @@ pub enum HAlign {
     Right,
 }
 
-/// 垂直对齐（Phase 1 预留，当前不参与求解）
+/// 垂直对齐
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VAlign {
     /// 顶部对齐
@@ -24,6 +24,9 @@ pub enum VAlign {
     Middle,
     /// 底部对齐
     Bottom,
+    /// 基线对齐：所有元素的基线对齐到同一 Y 坐标，
+    /// 行高由"最高基线 + 最大下伸"决定而非 max(height)
+    Baseline,
 }
 
 /// 全局排版配置——一次 `layout_rows()` 调用使用一套配置

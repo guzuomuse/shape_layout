@@ -2,6 +2,47 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 元素的尺寸策略 —— 决定元素如何响应空间变化
+///
+/// 对应 Figma / InDesign 的 Fixed / Fill 语义，
+/// 与 CSS 的 `flex-shrink` / `flex-grow` 正交。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SizeStrategy {
+    /// 固定尺寸：保持首选宽度不变
+    ///
+    /// `shrinkable` 控制空间不足时是否允许缩小到 [min_width, preferred] 之间。
+    Fixed {
+        /// 如果空间不够，是否允许缩小（不能低于 min_width）
+        #[serde(default)]
+        shrinkable: bool,
+    },
+    /// 弹性填充：可拉伸来填补剩余空间，亦可缩小当空间不足
+    ///
+    /// 等同于 CSS `flex: 1`（可伸可缩）。
+    Fill,
+}
+
+impl Default for SizeStrategy {
+    fn default() -> Self {
+        SizeStrategy::Fixed { shrinkable: false }
+    }
+}
+
+impl SizeStrategy {
+    /// 当前策略是否允许缩小
+    pub fn can_shrink(&self) -> bool {
+        match self {
+            SizeStrategy::Fixed { shrinkable } => *shrinkable,
+            SizeStrategy::Fill => true,
+        }
+    }
+
+    /// 当前策略是否允许拉伸（行内填满空间）
+    pub fn can_stretch(&self) -> bool {
+        matches!(self, SizeStrategy::Fill)
+    }
+}
+
 /// 一个待排版元素
 ///
 /// `width` / `height` 是元素的**首选尺寸**（偏好值），
@@ -12,7 +53,7 @@ pub struct LayoutElement {
     pub id: String,
     /// 首选宽度
     pub width: f64,
-    /// 首选高度（Phase 1 中高度固定不可变）
+    /// 首选高度
     pub height: f64,
     /// 宽度约束
     #[serde(default)]
@@ -20,6 +61,12 @@ pub struct LayoutElement {
     /// 每元素独立外边距（margin）
     #[serde(default)]
     pub margin: ElementMargin,
+    /// 基线位置：从元素顶部到基线的距离
+    ///
+    /// `None` 时回退为 `height`（底部对齐），
+    /// 这是 CSS / InDesign 的惯例：非文本元素底部对齐文本基线。
+    #[serde(default)]
+    pub baseline: Option<f64>,
 }
 
 /// 元素级别的外边距（margin）
@@ -68,19 +115,16 @@ impl ElementMargin {
 
 /// 元素级别的宽度约束
 ///
-/// 所有字段默认为无约束（`None` / `false`）。
+/// 所有字段默认为无约束（`None` / `Fixed`）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ElementConstraints {
     /// 最小宽度（低于此值不可缩）
     pub min_width: Option<f64>,
     /// 最大宽度（超过此值不可扩）
     pub max_width: Option<f64>,
-    /// 是否允许缩小来适应行宽
+    /// 尺寸策略（替代旧的 `shrinkable` / `stretchable` 双 bool）
     #[serde(default)]
-    pub shrinkable: bool,
-    /// 是否允许拉伸来填充行宽
-    #[serde(default)]
-    pub stretchable: bool,
+    pub size_strategy: SizeStrategy,
 }
 
 impl LayoutElement {
@@ -92,6 +136,7 @@ impl LayoutElement {
             height,
             constraints: ElementConstraints::default(),
             margin: ElementMargin::default(),
+            baseline: None,
         }
     }
 
@@ -108,7 +153,13 @@ impl LayoutElement {
             height,
             constraints: ElementConstraints::default(),
             margin,
+            baseline: None,
         }
+    }
+
+    /// 有效基线：`baseline` 指定值时用它，否则回退到 `height`（底部）
+    pub fn effective_baseline(&self) -> f64 {
+        self.baseline.unwrap_or(self.height)
     }
 
     /// 有效宽度：夹在 [min_width, max_width] 之间的首选宽度（不含 margin）

@@ -12,7 +12,7 @@ use kasuari::WeightedRelation::*;
 use kasuari::{Solver, Strength, Variable};
 use kurbo::BezPath;
 
-use crate::element::LayoutElement;
+use crate::element::{LayoutElement, SizeStrategy};
 use crate::region::RangeGenerator;
 use crate::result::{LayoutSolution, LayoutWarning, PlacedElement};
 use crate::rules::{HAlign, LayoutConfig, VAlign};
@@ -121,6 +121,22 @@ pub fn layout_rows(
         idx = new_idx;
         row_height = final_row_height;
 
+        // ── VAlign::Baseline 行高修正 ──
+        // row_height = max( max(baseline + margin.top), max(height - baseline + margin.bottom) )
+        if config.valign == VAlign::Baseline {
+            let mut max_ascent = 0.0_f64;
+            let mut max_descent = 0.0_f64;
+            for &ri in &row_indices {
+                let elem = &elements[ri];
+                let elem_baseline = elem.effective_baseline();
+                let ascent = elem_baseline + elem.margin.top;
+                let descent = (elem.height - elem_baseline).max(0.0) + elem.margin.bottom;
+                max_ascent = max_ascent.max(ascent);
+                max_descent = max_descent.max(descent);
+            }
+            row_height = max_ascent + max_descent;
+        }
+
         // 用实际行高重新查询区间（行内可能有更高元素改变了有效高度）
         let refined_row = rg.get_intervals_at(y, row_height, config.min_width);
         if !refined_row.is_empty() {
@@ -141,7 +157,7 @@ pub fn layout_rows(
                 .iter()
                 .map(|&ri| {
                     let e = &elements[ri];
-                    if e.constraints.shrinkable {
+                    if e.constraints.size_strategy.can_shrink() {
                         e.footprint_width_with(e.constraints.min_width.unwrap_or(0.0))
                     } else {
                         e.footprint_width()
@@ -205,6 +221,18 @@ pub fn layout_rows(
                         }
                         VAlign::Bottom => {
                             y + row_height - elem.margin.bottom - viz_height
+                        }
+                        VAlign::Baseline => {
+                            // max_ascent = max(baseline + margin.top) across the row
+                            let max_ascent = row_indices.iter()
+                                .map(|&ri| {
+                                    let e = &elements[ri];
+                                    e.effective_baseline() + e.margin.top
+                                })
+                                .fold(0.0_f64, f64::max);
+                            let elem_baseline = elem.effective_baseline();
+                            // 元素顶部 = row_y + max_ascent - baseline - margin.top
+                            y + max_ascent - elem_baseline - elem.margin.top
                         }
                     };
 
@@ -278,7 +306,7 @@ fn pack_row_elements(
             used_width = total_needed;
             row_height = row_height.max(elem.footprint_height());
             idx += 1;
-        } else if elem.constraints.shrinkable {
+        } else if elem.constraints.size_strategy.can_shrink() {
             // 尝试缩到最小宽度（含 margin）
             let min_w = elem
                 .constraints
@@ -321,6 +349,19 @@ fn pack_row_elements(
 
 /// 用 kasuari 求解一行的 X 轴布局
 ///
+/// 四态真值表（SizeStrategy → 约束强度）：
+///
+/// | SizeStrategy              | 收缩 | 拉伸 | 宽度偏好方程                               |
+/// |:--------------------------|:-----|:-----|:-------------------------------------------|
+/// | Fixed { shrinkable: false } | ❌    | ❌    | `== preferred` (**REQUIRED**)               |
+/// | Fixed { shrinkable: true }  | ✅    | ❌    | `<= preferred` (**REQUIRED**) + `== preferred` (**STRONG**) |
+/// | Fill                      | ✅    | ✅    | `== preferred` (**WEAK**)                   |
+///
+/// 所有状态叠加：
+/// - `min_width` → **REQUIRED**
+/// - `max_width` → **REQUIRED**
+/// - 行内有 Fill 元素时：`right_last - left_0 == interval_width` → **STRONG**
+///
 /// 返回 `Vec<(elem_index, x, width)>` 或错误信息。
 fn solve_row_x(
     elements: &[LayoutElement],
@@ -334,6 +375,7 @@ fn solve_row_x(
         return Ok(vec![]);
     }
 
+    let interval_width = interval_r - interval_l;
     let mut solver = Solver::new();
 
     // 为每个元素创建 left / right 变量
@@ -360,43 +402,73 @@ fn solve_row_x(
             .map_err(|e| format!("add_constraint right<=R failed: {e:?}"))?;
     }
 
-    // ── 宽度约束（含 margin 占地）──
+    // ── 宽度约束（四态真值表）──
+    let mut has_fill_in_row = false;
+
     for i in 0..n {
         let elem = &elements[row_indices[i]];
         let footprint_w = elem.footprint_width();
 
-        // right_i - left_i == footprint_width
-        // 不可缩元素用 REQUIRED（硬锁，宁愿求解失败也不允许被压扁）
-        // 可缩元素用 STRONG（边界约束为 REQUIRED 时 kasuari 会自动缩短）
-        let width_strength = if elem.constraints.shrinkable {
-            Strength::STRONG
-        } else {
-            Strength::REQUIRED
-        };
-        solver
-            .add_constraints(
-                [(right_vars[i] - left_vars[i]) | EQ(width_strength) | footprint_w],
-            )
-            .map_err(|e| format!("add_constraint width==preferred failed: {e:?}"))?;
+        match &elem.constraints.size_strategy {
+            SizeStrategy::Fixed { shrinkable: false } => {
+                // 状态 1: 不可缩不可伸 → == preferred (REQUIRED)
+                solver
+                    .add_constraints(
+                        [(right_vars[i] - left_vars[i])
+                            | EQ(Strength::REQUIRED)
+                            | footprint_w],
+                    )
+                    .map_err(|e| format!("add_constraint width==preferred(REQUIRED) failed: {e:?}"))?;
+            }
+            SizeStrategy::Fixed { shrinkable: true } => {
+                // 状态 2: 可缩不可伸
+                // width <= preferred (REQUIRED) — 可被压扁
+                solver
+                    .add_constraints(
+                        [(right_vars[i] - left_vars[i])
+                            | LE(Strength::REQUIRED)
+                            | footprint_w],
+                    )
+                    .map_err(|e| format!("add_constraint width<=preferred(REQUIRED) failed: {e:?}"))?;
+                // width == preferred (STRONG) — 偏好首选值
+                solver
+                    .add_constraints(
+                        [(right_vars[i] - left_vars[i])
+                            | EQ(Strength::STRONG)
+                            | footprint_w],
+                    )
+                    .map_err(|e| format!("add_constraint width==preferred(STRONG) failed: {e:?}"))?;
+            }
+            SizeStrategy::Fill => {
+                // 状态 4: 可缩可伸
+                // 不添加宽度相等约束（WEAK 会导致 kasuari 通过推位置而非拉伸来满足）
+                // 仅靠 min/max REQUIRED 边界 + STRONG row-fill 自然推动拉伸
+                has_fill_in_row = true;
+            }
+        }
 
-        // min_width 约束（含 margin）
+        // min_width 约束（含 margin）— 永远 REQUIRED
         if let Some(min_w) = elem.constraints.min_width {
             let min_footprint = elem.footprint_width_with(min_w);
             if min_footprint > 0.0 {
                 solver
                     .add_constraints(
-                        [(right_vars[i] - left_vars[i]) | GE(Strength::REQUIRED) | min_footprint],
+                        [(right_vars[i] - left_vars[i])
+                            | GE(Strength::REQUIRED)
+                            | min_footprint],
                     )
                     .map_err(|e| format!("add_constraint width>=min failed: {e:?}"))?;
             }
         }
 
-        // max_width 约束（含 margin）
+        // max_width 约束（含 margin）— 永远 REQUIRED
         if let Some(max_w) = elem.constraints.max_width {
             let max_footprint = elem.footprint_width_with(max_w);
             solver
                 .add_constraints(
-                    [(right_vars[i] - left_vars[i]) | LE(Strength::REQUIRED) | max_footprint],
+                    [(right_vars[i] - left_vars[i])
+                        | LE(Strength::REQUIRED)
+                        | max_footprint],
                 )
                 .map_err(|e| format!("add_constraint width<=max failed: {e:?}"))?;
         }
@@ -412,6 +484,36 @@ fn solve_row_x(
                 )
                 .map_err(|e| format!("add_constraint gap failed: {e:?}"))?;
         }
+    }
+
+    // ── Fill 元素紧跟前驱约束 ──
+    // 当元素是 FIll 时，偏好前驱 gap 精确贴合（STRONG），
+    // 配合 row-fill 将剩余空间推入 Fill 元素的宽度。
+    if has_fill_in_row && n > 1 {
+        for i in 1..n {
+            let elem = &elements[row_indices[i]];
+            if elem.constraints.size_strategy.can_stretch() {
+                solver
+                    .add_constraints(
+                        [(left_vars[i] - right_vars[i - 1])
+                            | EQ(Strength::STRONG)
+                            | config.gap],
+                    )
+                    .map_err(|e| format!("add_constraint fill-gap-adjacent failed: {e:?}"))?;
+            }
+        }
+    }
+
+    // ── 行填满约束（Fill 元素存在时）──
+    // right_last - left_0 == interval_width (STRONG)
+    // 当 max_width 阻止完全填满时，HAlign fallback 生效
+    if has_fill_in_row {
+        let last = n - 1;
+        solver
+            .add_constraints(
+                [(right_vars[last] - left_vars[0]) | EQ(Strength::STRONG) | interval_width],
+            )
+            .map_err(|e| format!("add_constraint row-fill failed: {e:?}"))?;
     }
 
     // ── 对齐约束 ──
@@ -645,8 +747,8 @@ mod tests {
     #[test]
     fn test_non_shrinkable_refused() {
         let container = square(0.0, 0.0, 40.0);
-        let mut fixed = LayoutElement::new("fixed", 50.0, 20.0);
-        fixed.constraints.shrinkable = false;
+        let fixed = LayoutElement::new("fixed", 50.0, 20.0);
+        // constraints 默认 SizeStrategy::Fixed { shrinkable: false }，无需额外设置
         let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
 
         let solution = layout_rows(&container, &[fixed], &config);
@@ -911,5 +1013,261 @@ mod tests {
 
         let solution = layout_rows(&container, &elements, &config);
         assert!(!solution.is_fully_placed());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 2: Stretch / Fill 测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 单个 Fill 元素填满整个区间
+    #[test]
+    fn test_single_fill_fills_interval() {
+        let container = square(0.0, 0.0, 100.0);
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        let config = LayoutConfig::with_spacing(5.0, 3.0, 5.0);
+        // 区间 = 100 - 5*2 = 90
+        // Fill 元素应被拉伸到填满整个区间
+
+        let solution = layout_rows(&container, &[fill_elem], &config);
+        assert!(solution.is_fully_placed());
+        let placed = &solution.placed[0];
+        // width 应该 ≈ 90（Fill 拉伸到区间全宽）
+        assert!(
+            (placed.width - 90.0).abs() < 2.0,
+            "Fill element should stretch to interval width, got width={}",
+            placed.width
+        );
+    }
+
+    /// 混合 Fixed + Fill：Fill 占据剩余空间
+    #[test]
+    fn test_fill_absorbs_remainder() {
+        let container = square(0.0, 0.0, 200.0);
+        let fixed_elem = LayoutElement::new("fixed", 40.0, 20.0);
+        // Fixed: 不可缩不可伸 → 40
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        // 区间 = 200 - 10 = 190
+        // Fixed 占 40, gap=5, 剩余 190 - 40 - 5 = 145 应分配给 Fill
+
+        let solution = layout_rows(&container, &[fixed_elem, fill_elem], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "warnings: {:?}",
+            solution.warnings
+        );
+        assert_eq!(solution.placed.len(), 2);
+
+        let fixed = &solution.placed[0];
+        assert!((fixed.width - 40.0).abs() < 1.0, "Fixed width should stay 40");
+
+        let fill = &solution.placed[1];
+        assert!(
+            fill.width > 40.0,
+            "Fill width should be >40 (got {}), absorbing remainder",
+            fill.width
+        );
+    }
+
+    /// max_width 限制 Fill 拉伸，HAlign fallback 生效
+    #[test]
+    fn test_fill_max_width_caps_expansion_center_fallback() {
+        let container = square(0.0, 0.0, 200.0);
+        let mut fill_elem = LayoutElement::new("fill_capped", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        fill_elem.constraints.max_width = Some(60.0);
+        // Fill 最多 60，不能填满 190 的区间 → HAlign::Center fallback
+
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.halign = HAlign::Center;
+
+        let solution = layout_rows(&container, &[fill_elem], &config);
+        assert!(solution.is_fully_placed());
+        let placed = &solution.placed[0];
+        // 视觉宽度不应超过 max_width（60），且在区间中居中
+        assert!(
+            placed.width <= 60.0 + 1.0,
+            "Fill width {} should not exceed max_width 60",
+            placed.width
+        );
+        // 居中：x ≈ (190 - width_with_margin) / 2 + 5
+        // width_with_margin ≈ width (no margin), so x ≈ (190 - width) / 2 + 5
+        let expected_x = (190.0 - placed.width) / 2.0 + 5.0;
+        assert!(
+            (placed.x - expected_x).abs() < 2.0,
+            "Capped Fill should center: x={}, expected_x≈{}",
+            placed.x,
+            expected_x
+        );
+    }
+
+    /// Fixed { shrinkable: true } 与 Fill 混合
+    #[test]
+    fn test_shrinkable_fixed_with_fill() {
+        let container = square(0.0, 0.0, 120.0);
+        // 可用宽度 = 120 - 5*2 = 110
+        let mut shrinkable = LayoutElement::new("shrink", 80.0, 20.0);
+        shrinkable.constraints.size_strategy = SizeStrategy::Fixed { shrinkable: true };
+        shrinkable.constraints.min_width = Some(30.0);
+
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        fill_elem.constraints.min_width = Some(10.0);
+        // 总 preferred = 80 + 5 + 20 = 105 ≤ 110 → 都能放
+        // shrinkable 保持 80（STRONG），Fill 获得剩余：110 - 80 - 5 = 25
+
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        let solution = layout_rows(&container, &[shrinkable, fill_elem], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "unplaced: {:?}",
+            solution.unplaced
+        );
+
+        let shrink = &solution.placed[0];
+        assert!(
+            (shrink.width - 80.0).abs() < 3.0,
+            "Shrinkable should stay at preferred 80"
+        );
+
+        let fill = &solution.placed[1];
+        assert!(
+            fill.width > 20.0,
+            "Fill should absorb extra space, got {}",
+            fill.width
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 2: Baseline 基线对齐测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 两个元素 baseline 对齐：不同高度、不同基线
+    #[test]
+    fn test_baseline_alignment() {
+        let container = square(0.0, 0.0, 300.0);
+        // tall: height=50, baseline=40 (文字基线在顶部下方 40 处)
+        let mut tall = LayoutElement::new("tall", 40.0, 50.0);
+        tall.baseline = Some(40.0);
+        // short: height=30, baseline=25
+        let mut short = LayoutElement::new("short", 40.0, 30.0);
+        short.baseline = Some(25.0);
+
+        let mut config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+        config.valign = VAlign::Baseline;
+
+        let solution = layout_rows(&container, &[tall, short], &config);
+        assert!(solution.is_fully_placed());
+
+        let tall_placed = &solution.placed[0];
+        let short_placed = &solution.placed[1];
+
+        // 两者基线应在同一 Y 坐标
+        let tall_baseline_y = tall_placed.y + 40.0;
+        let short_baseline_y = short_placed.y + 25.0;
+        assert!(
+            (tall_baseline_y - short_baseline_y).abs() < 1.0,
+            "baselines should align: tall_baseline_y={}, short_baseline_y={}",
+            tall_baseline_y,
+            short_baseline_y
+        );
+    }
+
+    /// baseline 为 None 时回退到 height（底部对齐）
+    #[test]
+    fn test_baseline_defaults_to_height() {
+        let container = square(0.0, 0.0, 300.0);
+        let mut has_baseline = LayoutElement::new("text", 30.0, 40.0);
+        has_baseline.baseline = Some(30.0);
+        let no_baseline = LayoutElement::new("image", 30.0, 50.0);
+        // no_baseline 的 effective_baseline() = 50（height），即底部对齐
+
+        let mut config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+        config.valign = VAlign::Baseline;
+
+        let solution = layout_rows(&container, &[has_baseline, no_baseline], &config);
+        assert!(solution.is_fully_placed());
+
+        let text = &solution.placed[0];
+        let image = &solution.placed[1];
+
+        // text 基线 Y = text.y + 30
+        // image "基线" Y = image.y + 50 (bottom of image)
+        // 两者应该对齐
+        let text_baseline_y = text.y + 30.0;
+        let image_bottom_y = image.y + 50.0;
+        assert!(
+            (text_baseline_y - image_bottom_y).abs() < 1.0,
+            "text baseline and image bottom should align"
+        );
+    }
+
+    /// 基线行高修正：行高由最高 ascent + 最大 descent 决定
+    #[test]
+    fn test_baseline_row_height_correction() {
+        let container = square(0.0, 0.0, 300.0);
+        // tall: height=100, baseline=30 → ascent=30, descent=70
+        let mut tall = LayoutElement::new("tall", 40.0, 100.0);
+        tall.baseline = Some(30.0);
+        // short: height=20, baseline=15 → ascent=15, descent=5
+        let short = LayoutElement::new("short", 40.0, 20.0);
+
+        let mut config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+        config.valign = VAlign::Baseline;
+
+        let solution = layout_rows(&container, &[tall, short], &config);
+        assert!(solution.is_fully_placed());
+
+        // tall 元素应完整可见（不被截断）
+        let tall_placed = &solution.placed[0];
+        // tall: y + row_height(=30+70=100) - tall.height(=100) >= y → top at y
+        // Actually: max_ascent=30, tall's y = row_y + max_ascent - tall.baseline
+        //   = 10 + 30 - 30 = 10 (top of tall is at row top)
+        assert!(
+            tall_placed.y >= 9.0 && tall_placed.y <= 11.0,
+            "tall element should not be clipped, y={}",
+            tall_placed.y
+        );
+    }
+
+    /// margin 与 baseline 组合
+    #[test]
+    fn test_baseline_with_margin() {
+        let container = square(0.0, 0.0, 300.0);
+        let mut a = LayoutElement::new("a", 40.0, 30.0);
+        a.baseline = Some(20.0);
+        a.margin = ElementMargin { top: 10.0, bottom: 5.0, left: 0.0, right: 0.0 };
+
+        let mut b = LayoutElement::new("b", 40.0, 40.0);
+        b.baseline = Some(25.0);
+        b.margin = ElementMargin { top: 3.0, bottom: 7.0, left: 0.0, right: 0.0 };
+
+        // ascent: a=20+10=30, b=25+3=28 → max_ascent=30
+        // descent: a=(30-20)+5=15, b=(40-25)+7=22 → max_descent=22
+        // row_height = 30+22=52
+
+        let mut config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+        config.valign = VAlign::Baseline;
+
+        let solution = layout_rows(&container, &[a, b], &config);
+        assert!(solution.is_fully_placed());
+
+        let a_placed = &solution.placed[0];
+        let b_placed = &solution.placed[1];
+
+        // baseline 在视觉内容框中的偏移 = margin.top + baseline
+        // a_baseline_y = a_placed.y + a.margin.top + a.effective_baseline()
+        // b_baseline_y = b_placed.y + b.margin.top + b.effective_baseline()
+        let a_baseline_y = a_placed.y + 10.0 + 20.0; // margin.top=10, baseline=20
+        let b_baseline_y = b_placed.y + 3.0 + 25.0;  // margin.top=3, baseline=25
+        assert!(
+            (a_baseline_y - b_baseline_y).abs() < 1.0,
+            "baselines should align even with margin: a_baseline_y={}, b_baseline_y={}",
+            a_baseline_y,
+            b_baseline_y
+        );
     }
 }
