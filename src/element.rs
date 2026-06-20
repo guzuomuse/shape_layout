@@ -132,12 +132,7 @@ impl LayoutElement {
     pub fn footprint_width_with(&self, w: f64) -> f64 {
         w + self.margin.left + self.margin.right
     }
-
-<<<<<<< HEAD
-    /// 垂直占地面积：内容高度 + 垂直 margin边距
-=======
     /// 垂直占地面积：内容高度 + 垂直 margin
->>>>>>> 0c974bc1acca6756d4081362ed494ad847146507
     pub fn footprint_height(&self) -> f64 {
         self.height + self.margin.top + self.margin.bottom
     }
