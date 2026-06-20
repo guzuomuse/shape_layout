@@ -474,33 +474,22 @@ fn solve_row_x(
         }
     }
 
-    // ── 间距约束：left_{i+1} >= right_i + gap ──
+    // ── 间距约束（双保险）：所有相邻 gap 全锁 ──
     // margin 已纳入 footprint 宽度，gap 直接叠加即可
+    // 1. REQUIRED 硬底线：gap >= config.gap
+    // 2. STRONG 精确锁死：gap == config.gap，防止膨胀，将拉伸力推入 Fill 宽度
     if n > 1 {
         for i in 0..(n - 1) {
             solver
                 .add_constraints(
                     [(left_vars[i + 1] - right_vars[i]) | GE(Strength::REQUIRED) | config.gap],
                 )
-                .map_err(|e| format!("add_constraint gap failed: {e:?}"))?;
-        }
-    }
-
-    // ── Fill 元素紧跟前驱约束 ──
-    // 当元素是 FIll 时，偏好前驱 gap 精确贴合（STRONG），
-    // 配合 row-fill 将剩余空间推入 Fill 元素的宽度。
-    if has_fill_in_row && n > 1 {
-        for i in 1..n {
-            let elem = &elements[row_indices[i]];
-            if elem.constraints.size_strategy.can_stretch() {
-                solver
-                    .add_constraints(
-                        [(left_vars[i] - right_vars[i - 1])
-                            | EQ(Strength::STRONG)
-                            | config.gap],
-                    )
-                    .map_err(|e| format!("add_constraint fill-gap-adjacent failed: {e:?}"))?;
-            }
+                .map_err(|e| format!("add_constraint gap>=min failed: {e:?}"))?;
+            solver
+                .add_constraints(
+                    [(left_vars[i + 1] - right_vars[i]) | EQ(Strength::STRONG) | config.gap],
+                )
+                .map_err(|e| format!("add_constraint gap==exact failed: {e:?}"))?;
         }
     }
 
@@ -1269,5 +1258,31 @@ mod tests {
             a_baseline_y,
             b_baseline_y
         );
+    }
+
+    /// [Fill, Fixed] 排列：Fill 在 Fixed 前面时仍然正确拉伸
+    /// 验证所有相邻 gap 全锁后，row-fill STRONG 约束将剩余空间推入 Fill 宽度
+    #[test]
+    fn test_fill_before_fixed() {
+        let container = square(0.0, 0.0, 200.0);
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        let fixed_elem = LayoutElement::new("fixed", 40.0, 20.0);
+
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        // padding.h=5*2=10, 容器内宽=190, Fixed占40, gap=5, Fill应占190-40-5=145
+        let solution = layout_rows(&container, &[fill_elem, fixed_elem], &config);
+        assert!(solution.is_fully_placed());
+
+        let fill = &solution.placed[0];
+        let fixed = &solution.placed[1];
+
+        // Fixed 保持 40
+        assert!((fixed.width - 40.0).abs() < 1.0, "Fixed should be 40, got {}", fixed.width);
+        // Fill 吸收了剩余空间
+        assert!(fill.width > 40.0, "Fill should absorb space, got {}", fill.width);
+        // gap = fill.right 到 fixed.left = 5
+        let gap = fixed.x - (fill.x + fill.width);
+        assert!((gap - 5.0).abs() < 1.0, "gap should be ~5, got {}", gap);
     }
 }
