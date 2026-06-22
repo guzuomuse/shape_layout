@@ -17,6 +17,12 @@ use crate::region::RangeGenerator;
 use crate::result::{LayoutSolution, LayoutWarning, PlacedElement};
 use crate::rules::{HAlign, LayoutConfig, VAlign};
 
+/// Fill 元素的最小内容宽度（像素）
+///
+/// 防止 Fill 元素仅靠 margin 占地就被打包进拥挤的行，
+/// 而后在约束求解阶段被 REQUIRED 约束碾压至宽度归零。
+const FILL_MIN_CONTENT_WIDTH: f64 = 1.0;
+
 /// 单次排版求解：在异形容器内按竖直流式排放矩形元素
 ///
 /// # 参数
@@ -92,8 +98,8 @@ pub fn layout_rows(
         let row_range = rg.get_intervals_at(y, row_height, config.min_width);
 
         if row_range.is_empty() {
-            // 无可用的行区间，推进 Y 继续尝试
-            y += config.step_size;
+            // 无可用的行区间，用元素高度跳跃（P0 智能跳跃：跳过死区）
+            y += elements[idx].footprint_height().max(config.step_size);
             continue;
         }
 
@@ -113,7 +119,7 @@ pub fn layout_rows(
 
         // 边界保护
         if interval_r - interval_l <= 0.0 {
-            y += config.step_size;
+            y += elements[idx].footprint_height().max(config.step_size);
             continue;
         }
 
@@ -122,8 +128,8 @@ pub fn layout_rows(
             pack_row_elements(elements, idx, interval_r - interval_l, config, &mut warnings);
 
         if row_indices.is_empty() {
-            // 连第一个元素都放不下 → 用行高推进 Y（而非微小步长）
-            y += row_height.max(config.step_size);
+            // 连第一个元素都放不下 → 用 footprint 高度跳跃（P0 智能跳跃，含 margin）
+            y += elements[idx].footprint_height().max(config.step_size);
             continue;
         }
 
@@ -218,23 +224,6 @@ pub fn layout_rows(
             &mut warnings,
         ) {
             Ok(x_solutions) => {
-                // 调试日志：对靠近心形右尖的 Fill 元素记录求解细节
-                const HEART_RIGHT_TIP_X: f64 = 200.0;
-                for &(elem_idx, resolved_x, resolved_width) in &x_solutions {
-                    let elem = &elements[elem_idx];
-                    let right_edge = resolved_x + resolved_width;
-                    if matches!(elem.constraints.size_strategy, SizeStrategy::Fill)
-                        && right_edge > HEART_RIGHT_TIP_X - 50.0
-                    {
-                        println!(
-                            "[fill_placed] id='{}' x={:.3} width={:.3} right_edge={:.3} | interval=({:.3}, {:.3}) interval_width={:.3} | row_y={:.3} row_h={:.3}",
-                            elem.id, resolved_x, resolved_width, right_edge,
-                            interval_l, interval_r, interval_r - interval_l,
-                            y, row_height,
-                        );
-                    }
-                }
-
                 for (elem_idx, resolved_x, resolved_width) in x_solutions {
                     let elem = &elements[elem_idx];
 
@@ -263,13 +252,38 @@ pub fn layout_rows(
                         }
                     };
 
-                    placed.push(PlacedElement {
-                        id: elem.id.clone(),
-                        x: resolved_x + elem.margin.left,
-                        y: final_y,
-                        width: resolved_width - elem.margin.left - elem.margin.right,
-                        height: viz_height,
-                    });
+                    // 🆕 内容盒边界保护：
+                    // 安全网钳制的是 footprint 范围 [resolved_x, resolved_x+resolved_width]，
+                    // 而 PlacedElement 输出的是 content box（去掉了 margin）。
+                    // 当 footprint 紧贴区间边界时，content box 可能因 margin 偏移而越界。
+                    let raw_content_x = resolved_x + elem.margin.left;
+                    let raw_content_w = (resolved_width - elem.margin.left - elem.margin.right)
+                        .max(0.0);
+                    let clamped_x = raw_content_x.max(interval_l);
+                    let clamped_right = (raw_content_x + raw_content_w).min(interval_r);
+                    let clamped_w = (clamped_right - clamped_x).max(0.0);
+
+                    // 🆕 零宽度过滤：width≈0 的元素实质不可见，归入 unplaced
+                    // 以保持 API 语义诚实（placed = 观察者可见的元素）
+                    const ZERO_WIDTH_EPSILON: f64 = 1e-9;
+                    if clamped_w > ZERO_WIDTH_EPSILON {
+                        placed.push(PlacedElement {
+                            id: elem.id.clone(),
+                            x: clamped_x,
+                            y: final_y,
+                            width: clamped_w,
+                            height: viz_height,
+                        });
+                    } else {
+                        unplaced.push(elem.id.clone());
+                        warnings.push(LayoutWarning::WidthConstraintUnsatisfiable {
+                            element_id: elem.id.clone(),
+                            message: format!(
+                                "element width collapsed to {:.3} (row too crowded for Fill element); moved to unplaced",
+                                clamped_w
+                            ),
+                        });
+                    }
                 }
             }
             Err(err_msg) => {
@@ -294,6 +308,15 @@ pub fn layout_rows(
         unplaced.len(),
         warnings.len(),
     );
+
+    // ── kasuari 负数坐标验证（Phase 2 Step 2）──
+    let placed_xs: Vec<String> = placed
+        .iter()
+        .map(|p| format!("{}={:.1}", p.id, p.x))
+        .collect();
+    println!("[kasusari_verify] placed X coords: {:?}", placed_xs);
+    let any_negative = placed.iter().any(|p| p.x < -1e-9);
+    println!("[kasusari_verify] any X < 0: {}", any_negative);
 
     LayoutSolution {
         placed,
@@ -342,11 +365,18 @@ fn pack_row_elements(
             idx += 1;
         } else if elem.constraints.size_strategy.can_shrink() {
             // 尝试缩到最小宽度（含 margin）
-            let min_w = elem
-                .constraints
-                .min_width
-                .unwrap_or(0.0)
-                .max(0.0);
+            // Fill 元素：至少保留 FILL_MIN_CONTENT_WIDTH 内容宽度，防止仅靠 margin 占地蒙混过关
+            let min_w = if matches!(elem.constraints.size_strategy, SizeStrategy::Fill) {
+                elem.constraints
+                    .min_width
+                    .unwrap_or(FILL_MIN_CONTENT_WIDTH)
+                    .max(FILL_MIN_CONTENT_WIDTH)
+            } else {
+                elem.constraints
+                    .min_width
+                    .unwrap_or(0.0)
+                    .max(0.0)
+            };
             let min_footprint = elem.footprint_width_with(min_w);
             let total_min = used_width + gap_needed + min_footprint;
 
@@ -389,12 +419,13 @@ fn pack_row_elements(
 /// |:--------------------------|:-----|:-----|:-------------------------------------------|
 /// | Fixed { shrinkable: false } | ❌    | ❌    | `== preferred` (**REQUIRED**)               |
 /// | Fixed { shrinkable: true }  | ✅    | ❌    | `<= preferred` (**REQUIRED**) + `== preferred` (**STRONG**) |
-/// | Fill                      | ✅    | ✅    | `== preferred` (**WEAK**)                   |
+/// | Fill                      | ✅    | ✅    | 无宽度偏好；靠 row-fill + 等宽约束驱动     |
 ///
 /// 所有状态叠加：
 /// - `min_width` → **REQUIRED**
 /// - `max_width` → **REQUIRED**
 /// - 行内有 Fill 元素时：`right_last - left_0 == interval_width` → **STRONG**
+/// - 行内有 ≥2 个 Fill 元素时：`width_fill_i == width_fill_0` → **STRONG**（防欠定退化）
 ///
 /// 返回 `Vec<(elem_index, x, width)>` 或错误信息。
 fn solve_row_x(
@@ -439,6 +470,7 @@ fn solve_row_x(
 
     // ── 宽度约束（四态真值表）──
     let mut has_fill_in_row = false;
+    let mut fill_indices: Vec<usize> = Vec::new(); // 收集 Fill 元素的行内索引
 
     for i in 0..n {
         let elem = &elements[row_indices[i]];
@@ -479,6 +511,20 @@ fn solve_row_x(
                 // 不添加宽度相等约束（WEAK 会导致 kasuari 通过推位置而非拉伸来满足）
                 // 仅靠 min/max REQUIRED 边界 + STRONG row-fill 自然推动拉伸
                 has_fill_in_row = true;
+                fill_indices.push(i);
+
+                // 🆕 保底：WEAK 级别最小内容宽度约束
+                // 当行内 Fixed/Shrinkable 的 REQUIRED 约束吞掉所有空间时，
+                // 此约束给 Fill 保留至少 1px 内容宽度，防止归零。
+                // WEAK 优先级最低，不会与 STRONG row-fill 或 REQUIRED 边界冲突。
+                let min_content_footprint = elem.footprint_width_with(FILL_MIN_CONTENT_WIDTH);
+                solver
+                    .add_constraints(
+                        [(right_vars[i] - left_vars[i])
+                            | GE(Strength::WEAK)
+                            | min_content_footprint],
+                    )
+                    .map_err(|e| format!("add_constraint fill-min-content failed: {e:?}"))?;
             }
         }
 
@@ -525,6 +571,23 @@ fn solve_row_x(
                     [(left_vars[i + 1] - right_vars[i]) | EQ(Strength::STRONG) | config.gap],
                 )
                 .map_err(|e| format!("add_constraint gap==exact failed: {e:?}"))?;
+        }
+    }
+
+    // ── 多 Fill 等宽约束（N ≥ 2）──
+    // 当一行中有 ≥2 个 Fill 元素时，row-fill 约束只管总体跨度，不管内部分配。
+    // 不加等宽约束会导致求解器欠定 → Fill 宽度退化为 0。
+    // STRONG 级别：不会抢夺 REQUIRED 边界约束的优先级，安全网仍在。
+    if fill_indices.len() >= 2 {
+        let first = fill_indices[0];
+        for &fi in &fill_indices[1..] {
+            let width_expr = right_vars[fi] - left_vars[fi];
+            let first_width = right_vars[first] - left_vars[first];
+            solver
+                .add_constraints(
+                    [(width_expr - first_width) | EQ(Strength::STRONG) | 0.0],
+                )
+                .map_err(|e| format!("add_constraint fill-equal-width failed: {e:?}"))?;
         }
     }
 
@@ -1363,6 +1426,58 @@ mod tests {
             "baselines should align even with margin: a_baseline_y={}, b_baseline_y={}",
             a_baseline_y,
             b_baseline_y
+        );
+    }
+
+    /// 多个 Fill 元素均分剩余空间（Phase 2.5 等宽约束）
+    /// 验证 N≥2 个 Fill 时，等宽 STRONG 约束防止求解器欠定退化
+    #[test]
+    fn test_multiple_fill_share_equally() {
+        let container = square(0.0, 0.0, 200.0);
+        let mut fill_a = LayoutElement::new("fill_a", 20.0, 20.0);
+        fill_a.constraints.size_strategy = SizeStrategy::Fill;
+        let mut fill_b = LayoutElement::new("fill_b", 20.0, 20.0);
+        fill_b.constraints.size_strategy = SizeStrategy::Fill;
+
+        let config = LayoutConfig::with_spacing(5.0, 10.0, 5.0);
+        // 容器宽 200, padding 5*2=10 → interval=190
+        // 2 个 Fill + 1 个 gap=10 → 每个 Fill 应占 (190-10)/2 = 90
+        let solution = layout_rows(&container, &[fill_a, fill_b], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "two Fill elements should be placed, unplaced: {:?}, warnings: {:?}",
+            solution.unplaced,
+            solution.warnings
+        );
+        assert_eq!(solution.placed.len(), 2);
+
+        let a = &solution.placed[0];
+        let b = &solution.placed[1];
+        // 两者宽度应该都 > 0
+        assert!(a.width > 10.0, "fill_a width={}, should be > 10", a.width);
+        assert!(b.width > 10.0, "fill_b width={}, should be > 10", b.width);
+        // 两者宽度应该基本相等（STRONG 等宽约束）
+        assert!(
+            (a.width - b.width).abs() < 5.0,
+            "fill widths should be approximately equal, got a={}, b={}",
+            a.width,
+            b.width
+        );
+        // 总跨度应近似填满区间
+        let total_span = (b.x + b.width) - a.x;
+        assert!(
+            (total_span - 190.0).abs() < 3.0,
+            "total span should be ~190, got {}",
+            total_span
+        );
+        // 无 safety net 警告
+        let constraint_warnings = solution.warnings.iter().filter(|w| {
+            matches!(w, LayoutWarning::ConstraintConflict(_))
+        }).count();
+        assert_eq!(
+            constraint_warnings, 0,
+            "should have no constraint conflicts (safety net bogus), got {} warnings: {:?}",
+            constraint_warnings, solution.warnings
         );
     }
 
