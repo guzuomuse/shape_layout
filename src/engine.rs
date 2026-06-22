@@ -16,12 +16,46 @@ use crate::element::{LayoutElement, SizeStrategy};
 use crate::region::RangeGenerator;
 use crate::result::{LayoutSolution, LayoutWarning, PlacedElement};
 use crate::rules::{HAlign, LayoutConfig, VAlign};
+use crate::shape::ContainerShape;
+
+/// 条件打印宏：仅在 `verbose` feature 开启时输出诊断日志
+///
+/// 使用 `cfg!()` 代替 `#[cfg]` 编译条件，确保表达式始终被求值
+/// （消除未使用变量警告），运行时由编译器优化掉 false 分支。
+macro_rules! vprintln {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "verbose") {
+            println!($($arg)*);
+        }
+    };
+}
 
 /// Fill 元素的最小内容宽度（像素）
 ///
 /// 防止 Fill 元素仅靠 margin 占地就被打包进拥挤的行，
 /// 而后在约束求解阶段被 REQUIRED 约束碾压至宽度归零。
 const FILL_MIN_CONTENT_WIDTH: f64 = 1.0;
+
+/// 单次排版求解（容器形状入口）—— 推荐的外部 API
+///
+/// 接受 `ContainerShape`（可序列化的逻辑实体），
+/// 内部调用 `to_bezpath()` 转换为物理路径后送入 `layout_rows`。
+///
+/// # 参数
+/// - `container`：容器形状（内置或自定义，均可序列化）
+/// - `elements`：待排版元素列表
+/// - `config`：全局排版配置
+///
+/// # 返回
+/// `LayoutSolution` 包含已排放元素、未排放元素、警告信息。
+pub fn layout_container(
+    container: &ContainerShape,
+    elements: &[LayoutElement],
+    config: &LayoutConfig,
+) -> LayoutSolution {
+    let bezpath = container.to_bezpath();
+    layout_rows(&bezpath, elements, config)
+}
 
 /// 单次排版求解：在异形容器内按竖直流式排放矩形元素
 ///
@@ -44,7 +78,7 @@ const FILL_MIN_CONTENT_WIDTH: f64 = 1.0;
 ///     贪心塞入元素直到放不下
 ///     kasuari 求解行内约束 → 得到每个元素的 X
 ///     记录 PlacedElement { x, y, width, height }
-///     y += row_h + line_spacing
+///     y -= row_h + line_spacing  (从上到下排版)
 /// ```
 pub fn layout_rows(
     container: &BezPath,
@@ -58,7 +92,7 @@ pub fn layout_rows(
     };
 
     // 调试心跳：每次排版都打印容器范围
-    println!(
+    vprintln!(
         "[layout_rows] START | container_bbox=({:.1},{:.1}→{:.1},{:.1}) | elements={} | padding=(l:{},r:{},t:{},b:{})",
         rg.extents.x0, rg.extents.y0, rg.extents.x1, rg.extents.y1,
         elements.len(),
@@ -66,24 +100,28 @@ pub fn layout_rows(
         config.padding_top, config.padding_bottom,
     );
 
-    let max_y = rg.extents.y1 - config.padding_bottom;
     let container_y0 = rg.extents.y0;
+    let container_top = rg.extents.y1 - config.padding_bottom;
+    let container_bottom = container_y0 + config.padding_top;
     let mut placed: Vec<PlacedElement> = Vec::new();
     let mut warnings: Vec<LayoutWarning> = Vec::new();
     let mut unplaced: Vec<String> = Vec::new();
 
-    let mut y = container_y0 + config.padding_top;
+    // 从上到下排版：首行顶部贴齐容器顶部
+    let first_est_height = elements[0].height;
+    let mut y = container_top - first_est_height;
+    let mut prev_row_bottom = container_top; // 🛡️ 记住上一行底部，防御行间 Y 轴重叠
     let mut idx: usize = 0;
 
     while idx < elements.len() {
-        // 检查容器底部溢出（留 1e-9 容差，避免误杀刚好贴底的行）
-        if y > max_y + 1e-9 {
+        // 检查容器底部溢出：行底部低于容器底部则全部溢出
+        if y < container_bottom - 1e-9 {
             for i in idx..elements.len() {
                 warnings.push(LayoutWarning::Overflow {
                     element_id: elements[i].id.clone(),
                     message: format!(
-                        "container bottom reached at y={:.1}, max_y={:.1}",
-                        y, max_y
+                        "container bottom reached at y={:.1}, container_bottom={:.1}",
+                        y, container_bottom
                     ),
                 });
                 unplaced.push(elements[i].id.clone());
@@ -98,43 +136,61 @@ pub fn layout_rows(
         let row_range = rg.get_intervals_at(y, row_height, config.min_width);
 
         if row_range.is_empty() {
-            // 无可用的行区间，用元素高度跳跃（P0 智能跳跃：跳过死区）
-            y += elements[idx].footprint_height().max(config.step_size);
+            // 无可用的行区间，用元素高度向下跳跃（P0 智能跳跃：跳过死区）
+            y -= elements[idx].footprint_height().max(config.step_size);
             continue;
         }
 
-        // 取最宽区间
-        let widest = row_range
-            .intervals
-            .iter()
-            .max_by(|a, b| {
-                (a.1 - a.0)
-                    .partial_cmp(&(b.1 - b.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .expect("row_range is non-empty");
+        // 多区间贪心选择：遍历所有区间，选能放入最多元素的那个
+        // 心形/回字形等异形容器在单行可能产生多个区间，单取最宽会浪费可用空间
+        let mut best_count: usize = 0;
+        let mut best_iv: (f64, f64) = (0.0, 0.0);
+        let mut best_pack: Option<(Vec<usize>, usize, f64, Vec<LayoutWarning>)> = None;
 
-        let mut interval_l = widest.0 + config.padding_left;
-        let mut interval_r = widest.1 - config.padding_right;
+        for iv in &row_range.intervals {
+            let iv_w = iv.1 - iv.0;
+            let avail = iv_w - config.padding_left - config.padding_right;
+            // 提前跳过明显不够宽的区间（连第一个元素的最小宽度都装不下）
+            let first = &elements[idx];
+            let min_needed = if first.constraints.size_strategy.can_shrink() {
+                first.footprint_width_with(first.constraints.min_width.unwrap_or(0.0))
+            } else {
+                first.footprint_width()
+            };
+            if avail < min_needed - 1e-9 {
+                continue;
+            }
 
-        // 边界保护
+            let mut trial_warnings: Vec<LayoutWarning> = Vec::new();
+            let (indices, _next, _row_h) =
+                pack_row_elements(elements, idx, avail, config, &mut trial_warnings);
+            if indices.len() > best_count {
+                best_count = indices.len();
+                best_iv = *iv;
+                best_pack = Some((indices, _next, _row_h, trial_warnings));
+            }
+        }
+
+        if best_count == 0 {
+            // 所有区间都放不下第一个元素 → 向下跳跃
+            y -= elements[idx].footprint_height().max(config.step_size);
+            continue;
+        }
+
+        let (mut row_indices, next_idx, found_row_height, trial_warnings) = best_pack.unwrap();
+        warnings.extend(trial_warnings);
+        let row_start_idx = idx;
+        idx = next_idx;
+        row_height = found_row_height;
+
+        let mut interval_l = best_iv.0 + config.padding_left;
+        let mut interval_r = best_iv.1 - config.padding_right;
+
+        // 边界保护（多区间选择后的兜底）
         if interval_r - interval_l <= 0.0 {
-            y += elements[idx].footprint_height().max(config.step_size);
+            y -= elements[idx].footprint_height().max(config.step_size);
             continue;
         }
-
-        // 4. 贪心塞入元素
-        let (row_indices, new_idx, final_row_height) =
-            pack_row_elements(elements, idx, interval_r - interval_l, config, &mut warnings);
-
-        if row_indices.is_empty() {
-            // 连第一个元素都放不下 → 用 footprint 高度跳跃（P0 智能跳跃，含 margin）
-            y += elements[idx].footprint_height().max(config.step_size);
-            continue;
-        }
-
-        idx = new_idx;
-        row_height = final_row_height;
 
         // ── VAlign::Baseline 行高修正 ──
         // row_height = max( max(baseline + margin.top), max(height - baseline + margin.bottom) )
@@ -154,19 +210,29 @@ pub fn layout_rows(
 
         // 用实际行高重新查询区间（行内可能有更高元素改变了有效高度）
         let refined_row = rg.get_intervals_at(y, row_height, config.min_width);
+        let mut refinement_applied = false;
+        let mut refined_raw_iv: Option<(f64, f64)> = None;
         if !refined_row.is_empty() {
-            if let Some(widest_refined) = refined_row.intervals.iter().max_by(|a, b| {
-                (a.1 - a.0)
-                    .partial_cmp(&(b.1 - b.0))
+            // 选离 best_iv 中心最近的 refined 区间（防止分叉形容器跳到另一侧）
+            let best_center = (best_iv.0 + best_iv.1) / 2.0;
+            if let Some(closest_refined) = refined_row.intervals.iter().min_by(|a, b| {
+                let ca = (a.0 + a.1) / 2.0;
+                let cb = (b.0 + b.1) / 2.0;
+                (ca - best_center)
+                    .abs()
+                    .partial_cmp(&(cb - best_center).abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             }) {
-                interval_l = widest_refined.0 + config.padding_left;
-                interval_r = widest_refined.1 - config.padding_right;
+                refined_raw_iv = Some(*closest_refined);
+                interval_l = closest_refined.0 + config.padding_left;
+                interval_r = closest_refined.1 - config.padding_right;
+                refinement_applied = true;
             }
         }
 
         // 校验 refinement 后的区间仍能容纳行内元素（防止沙漏形容器因行高增大
-        // 导致区间缩水到放不下已打包元素，退回原始区间）
+        // 导致区间缩水到放不下已打包元素）
+        let mut safety_net_triggered = false;
         if !row_indices.is_empty() {
             let row_min_span: f64 = row_indices
                 .iter()
@@ -181,21 +247,77 @@ pub fn layout_rows(
                 .sum::<f64>()
                 + (row_indices.len().saturating_sub(1)) as f64 * config.gap;
             if interval_r - interval_l < row_min_span - 1e-9 {
-                // refinement 后区间太窄，回退到原始区间
-                interval_l = widest.0 + config.padding_left;
-                interval_r = widest.1 - config.padding_right;
+                safety_net_triggered = true;
+                if refinement_applied {
+                    // 沙漏容器：行高增大→轮廓收窄，best_iv 已过期
+                    // 用 refined 真实物理区间的宽度重新打包，放不下的延迟到后续行
+                    let refined_avail = refined_raw_iv
+                        .map_or(
+                            (interval_r - interval_l).max(0.0),
+                            |(rl, rr)| (rr - rl) - config.padding_left - config.padding_right,
+                        )
+                        .max(0.0);
+                    let mut re_pack_warnings: Vec<LayoutWarning> = Vec::new();
+                    let (new_row_indices, new_next_idx, new_row_height) = pack_row_elements(
+                        elements,
+                        row_start_idx,
+                        refined_avail,
+                        config,
+                        &mut re_pack_warnings,
+                    );
+                    if new_row_indices.is_empty() {
+                        // 连一个元素都放不下 → 跳过首元素，下次循环再试
+                        warnings.push(LayoutWarning::ElementTooWide {
+                            element_id: elements[row_start_idx].id.clone(),
+                            min_width: elements[row_start_idx].footprint_width(),
+                            max_available: refined_avail,
+                        });
+                        idx = row_start_idx + 1;
+                        y -= elements[row_start_idx].footprint_height().max(config.step_size);
+                        continue;
+                    }
+                    warnings.extend(re_pack_warnings);
+                    row_indices = new_row_indices;
+                    idx = new_next_idx;
+                    row_height = new_row_height;
+                    // interval_l/r 保持 refined 值不变（真实物理边界）
+                } else {
+                    // 无 refinement → 回退到 best_iv
+                    interval_l = best_iv.0 + config.padding_left;
+                    interval_r = best_iv.1 - config.padding_right;
+                }
             }
         }
 
-        // Bug B fix: 检查整行（含已打包元素）是否在容器底部以内
-        if y + row_height > max_y + 1e-9 {
+        // 🛡️ 行间 Y 轴安全网：当本行顶部高于上一行底部时（即高行侵入矮行），
+        // 强制将本行压到上一行底部之下，保证两行不重叠。
+        // 触发场景：下一行高度 > 当前行高度 + 行间距
+        if y + row_height > prev_row_bottom + 1e-9 {
+            y = prev_row_bottom - row_height;
+            safety_net_triggered = true;
+        }
+
+        // 🔍 诊断日志：Refinement & Safety Net
+        {
+            let row_element_ids: Vec<&str> = row_indices.iter().map(|&ri| elements[ri].id.as_str()).collect();
+            vprintln!(
+                "[refine] y={:.1} row_h={:.1} elements={:?} | best_iv=({:.1},{:.1}) w={:.1} | refined_raw={:?} refined_applied={} safety_net={} | final=({:.1},{:.1}) w={:.1}",
+                y, row_height, row_element_ids,
+                best_iv.0, best_iv.1, best_iv.1 - best_iv.0,
+                refined_raw_iv, refinement_applied, safety_net_triggered,
+                interval_l, interval_r, interval_r - interval_l,
+            );
+        }
+
+        // 检查行底部是否低于容器底部（行高变化后重检）
+        if y < container_bottom - 1e-9 {
             // 已打包到行内的元素
             for &ri in &row_indices {
                 warnings.push(LayoutWarning::Overflow {
                     element_id: elements[ri].id.clone(),
                     message: format!(
-                        "row exceeds container bottom: y={:.1} + row_height={:.1} > max_y={:.1}",
-                        y, row_height, max_y
+                        "row below container bottom: y={:.1} < container_bottom={:.1}",
+                        y, container_bottom
                     ),
                 });
                 unplaced.push(elements[ri].id.clone());
@@ -205,8 +327,8 @@ pub fn layout_rows(
                 warnings.push(LayoutWarning::Overflow {
                     element_id: elements[i].id.clone(),
                     message: format!(
-                        "row exceeds container bottom: y={:.1} + row_height={:.1} > max_y={:.1}",
-                        y, row_height, max_y
+                        "row below container bottom: y={:.1} < container_bottom={:.1}",
+                        y, container_bottom
                     ),
                 });
                 unplaced.push(elements[i].id.clone());
@@ -215,6 +337,7 @@ pub fn layout_rows(
         }
 
         // 5. kasuari 求解行内 X 位置
+        let mut row_footprints: Vec<(usize, f64, f64)> = Vec::new();
         match solve_row_x(
             elements,
             &row_indices,
@@ -225,6 +348,7 @@ pub fn layout_rows(
         ) {
             Ok(x_solutions) => {
                 for (elem_idx, resolved_x, resolved_width) in x_solutions {
+                    row_footprints.push((elem_idx, resolved_x, resolved_width));
                     let elem = &elements[elem_idx];
 
                     // ── VAlign: 垂直对齐 + margin ──
@@ -263,6 +387,28 @@ pub fn layout_rows(
                     let clamped_right = (raw_content_x + raw_content_w).min(interval_r);
                     let clamped_w = (clamped_right - clamped_x).max(0.0);
 
+                    // 🔍 诊断日志：逐元素 footprint bounds vs 区间边界 + Y 坐标
+                    {
+                        let fp_left = resolved_x;
+                        let fp_right = resolved_x + resolved_width;
+                        let fp_overflow_left = interval_l - fp_left;
+                        let fp_overflow_right = fp_right - interval_r;
+                        let ct_left = clamped_x;
+                        let ct_right = clamped_x + clamped_w;
+                        let ct_overflow_left = interval_l - ct_left;
+                        let ct_overflow_right = ct_right - interval_r;
+                        let y_top = final_y + viz_height; // 元素顶部 Y
+                        vprintln!(
+                            "[elem_place] id={:<4} fp=({:.1},{:.1}) ct=({:.1},{:.1}) | y={:.1} h={:.1} Y=[{:.1}→{:.1}] | interval=({:.1},{:.1}) | fp_ovf=(L:{:.3},R:{:.3}) ct_ovf=(L:{:.3},R:{:.3}) | margin=(l:{:.1},r:{:.1})",
+                            elem.id, fp_left, fp_right, ct_left, ct_right,
+                            final_y, viz_height, final_y, y_top,
+                            interval_l, interval_r,
+                            fp_overflow_left.max(0.0), fp_overflow_right.max(0.0),
+                            ct_overflow_left.max(0.0), ct_overflow_right.max(0.0),
+                            elem.margin.left, elem.margin.right,
+                        );
+                    }
+
                     // 🆕 零宽度过滤：width≈0 的元素实质不可见，归入 unplaced
                     // 以保持 API 语义诚实（placed = 观察者可见的元素）
                     const ZERO_WIDTH_EPSILON: f64 = 1e-9;
@@ -299,10 +445,54 @@ pub fn layout_rows(
             }
         }
 
-        y += row_height + config.line_spacing;
+        // 🔍 诊断日志：行摘要 — 整行元素 footprint span vs 区间
+        {
+            let row_placed_end = placed.len();
+            let row_placed_start = row_placed_end.saturating_sub(row_indices.len());
+            let row_placed_slice = &placed[row_placed_start..row_placed_end];
+            let mut fp_left_min = f64::MAX;
+            let mut fp_right_max = f64::MIN;
+            let mut ct_left_min = f64::MAX;
+            let mut ct_right_max = f64::MIN;
+            let mut ids = Vec::new();
+            for &(ei, fp_x, fp_w) in &row_footprints {
+                let elem = &elements[ei];
+                ids.push(elem.id.as_str());
+                let fp_left = fp_x;
+                let fp_right = fp_x + fp_w;
+                fp_left_min = fp_left_min.min(fp_left);
+                fp_right_max = fp_right_max.max(fp_right);
+            }
+            for p in row_placed_slice {
+                ct_left_min = ct_left_min.min(p.x);
+                ct_right_max = ct_right_max.max(p.x + p.width);
+            }
+            let fp_span = fp_right_max - fp_left_min;
+            let ct_span = ct_right_max - ct_left_min;
+            let interval_w = interval_r - interval_l;
+            let fp_overflow_r = fp_right_max - interval_r;
+            let ct_overflow_r = ct_right_max - interval_r;
+            let row_bottom_y = y; // 行底（从上到下排版，y 指向行底部）
+            let row_top_y = y + row_height; // 行顶
+            let next_row_y = y - row_height - config.line_spacing; // 下一行 y
+            vprintln!(
+                "[row_done] y={:.1} h={:.1} ids={:?} | interval=({:.1},{:.1}) w={:.1} | fp_span=({:.1},{:.1})={:.1} ct_span=({:.1},{:.1})={:.1} | row_Y=[{:.1}→{:.1}] gap_to_next={:.1} | overflow: fp_r={:.3} ct_r={:.3} safety_net={}",
+                y, row_height, ids,
+                interval_l, interval_r, interval_w,
+                fp_left_min, fp_right_max, fp_span,
+                ct_left_min, ct_right_max, ct_span,
+                row_bottom_y, row_top_y,
+                row_bottom_y - next_row_y - row_height, // gap = current_bottom - next_top
+                fp_overflow_r.max(0.0), ct_overflow_r.max(0.0),
+                safety_net_triggered,
+            );
+        }
+
+        prev_row_bottom = y;
+        y -= row_height + config.line_spacing;
     }
 
-    println!(
+    vprintln!(
         "[layout_rows] DONE | placed={} unplaced={} warnings={}",
         placed.len(),
         unplaced.len(),
@@ -314,9 +504,9 @@ pub fn layout_rows(
         .iter()
         .map(|p| format!("{}={:.1}", p.id, p.x))
         .collect();
-    println!("[kasusari_verify] placed X coords: {:?}", placed_xs);
+    vprintln!("[kasusari_verify] placed X coords: {:?}", placed_xs);
     let any_negative = placed.iter().any(|p| p.x < -1e-9);
-    println!("[kasusari_verify] any X < 0: {}", any_negative);
+    vprintln!("[kasusari_verify] any X < 0: {}", any_negative);
 
     LayoutSolution {
         placed,
@@ -919,7 +1109,7 @@ mod tests {
         assert_eq!(solution.unplaced[0], "fixed");
     }
 
-    /// 窄缩容器（三角形）：顶部宽、底部窄，底部元素可能放不下
+    /// 窄缩容器（三角形）：从上到下排版，越往下 Y 越小
     #[test]
     fn test_narrowing_triangle() {
         let container = right_triangle(0.0, 0.0, 100.0, 100.0);
@@ -929,15 +1119,15 @@ mod tests {
         let config = LayoutConfig::with_spacing(2.0, 2.0, 2.0);
 
         let solution = layout_rows(&container, &elements, &config);
-        // 三角形顶部宽 100，底部趋近 0，至少应排放 ≥ 2 个
+        // 三角形顶部宽 100（高 Y），底部趋近 0（低 Y），至少应排放 ≥ 2 个
         assert!(
             solution.placed.len() >= 2,
             "expected ≥2 placed in triangle, got {} placed",
             solution.placed.len()
         );
-        // 越靠下的元素 Y 越大
+        // 从上到下排版 → 后排放的元素 Y 更小（越靠下）
         for w in solution.placed.windows(2) {
-            assert!(w[1].y >= w[0].y, "rows should go downward");
+            assert!(w[1].y <= w[0].y, "rows should go downward (y decreasing)");
         }
     }
 
@@ -962,7 +1152,7 @@ mod tests {
     // Phase 1.5 新功能测试
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// VAlign::Middle —— 行内矮元素垂直居中
+    /// VAlign::Middle —— 行内矮元素垂直居中 (从上到下排版)
     #[test]
     fn test_valign_middle() {
         let container = square(0.0, 0.0, 200.0);
@@ -976,20 +1166,21 @@ mod tests {
         let solution = layout_rows(&container, &elements, &config);
         assert!(solution.is_fully_placed());
 
-        // tall 元素：高度等于行高，y 不变
+        // container_top = 195, row_height = 50, y(行底) = 195-50 = 145
+        // tall 元素：高度等于行高，y 为行底
         let tall = &solution.placed[0];
-        assert!((tall.y - 5.0).abs() < 1.0, "tall y should ≈5");
+        assert!((tall.y - 145.0).abs() < 1.0, "tall y should ≈145, got {}", tall.y);
 
-        // short 元素：居中 y = 5 + (50-10)/2 = 25
+        // short 元素：居中 y = 145 + (50-10)/2 = 165
         let short = &solution.placed[1];
         assert!(
-            (short.y - 25.0).abs() < 1.0,
-            "short valign=middle y should ≈25, got {}",
+            (short.y - 165.0).abs() < 1.0,
+            "short valign=middle y should ≈165, got {}",
             short.y
         );
     }
 
-    /// VAlign::Bottom —— 行内矮元素贴底
+    /// VAlign::Bottom —— 行内矮元素贴底 (从上到下排版)
     #[test]
     fn test_valign_bottom() {
         let container = square(0.0, 0.0, 200.0);
@@ -1004,15 +1195,16 @@ mod tests {
         assert!(solution.is_fully_placed());
 
         let short = &solution.placed[1];
-        // bottom: y = 5 + 50 - 10 = 45
+        // container_top = 195, y(行底) = 195-50 = 145
+        // bottom: y = 145 + 50 - 10 = 185
         assert!(
-            (short.y - 45.0).abs() < 1.0,
-            "short valign=bottom y should ≈45, got {}",
+            (short.y - 185.0).abs() < 1.0,
+            "short valign=bottom y should ≈185, got {}",
             short.y
         );
     }
 
-    /// VAlign::Top 是默认，不需要特殊处理
+    /// VAlign::Top 是默认，不需要特殊处理 (从上到下排版)
     #[test]
     fn test_valign_top_default() {
         let container = square(0.0, 0.0, 200.0);
@@ -1026,7 +1218,12 @@ mod tests {
         assert!(solution.is_fully_placed());
 
         let short = &solution.placed[1];
-        assert!((short.y - 5.0).abs() < 1.0, "short valign=top y should ≈5");
+        // container_top = 195, y(行底) = 195-50 = 145, VAlign::Top: short.y = y = 145
+        assert!(
+            (short.y - 145.0).abs() < 1.0,
+            "short valign=top y should ≈145, got {}",
+            short.y
+        );
     }
 
     /// 元素 Margin —— 水平 margin 增加占地面积
@@ -1094,12 +1291,13 @@ mod tests {
         assert!(solution.is_fully_placed());
 
         // row_height = max(20, 5+10+5) = 20 (plain 更高)
+        // container_top = 195, y(行底) = 195-20 = 175
         // margined element Middle: y + margin.top + (row_height - footprint_height) / 2
-        //   = 5 + 5 + (20 - 20) / 2 = 10
+        //   = 175 + 5 + (20 - 20) / 2 = 180
         let margined = &solution.placed[1];
         assert!(
-            (margined.y - 10.0).abs() < 1.0,
-            "margined middle y should ≈10, got {}",
+            (margined.y - 180.0).abs() < 1.0,
+            "margined middle y should ≈180, got {}",
             margined.y
         );
     }
@@ -1381,11 +1579,10 @@ mod tests {
 
         // tall 元素应完整可见（不被截断）
         let tall_placed = &solution.placed[0];
-        // tall: y + row_height(=30+70=100) - tall.height(=100) >= y → top at y
-        // Actually: max_ascent=30, tall's y = row_y + max_ascent - tall.baseline
-        //   = 10 + 30 - 30 = 10 (top of tall is at row top)
+        // container_top = 300-10 = 290, y(行底) = 290-100 = 190
+        // max_ascent=30, tall's y = y + max_ascent - tall.baseline = 190+30-30 = 190
         assert!(
-            tall_placed.y >= 9.0 && tall_placed.y <= 11.0,
+            tall_placed.y >= 189.0 && tall_placed.y <= 191.0,
             "tall element should not be clipped, y={}",
             tall_placed.y
         );
@@ -1505,5 +1702,197 @@ mod tests {
         // gap = fill.right 到 fixed.left = 5
         let gap = fixed.x - (fill.x + fill.width);
         assert!((gap - 5.0).abs() < 1.0, "gap should be ~5, got {}", gap);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RON 序列化往返测试（Step 0.5d）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// ContainerShape 所有变体的 RON roundtrip
+    #[test]
+    fn test_container_shape_ron_roundtrip() {
+        let shapes = vec![
+            ContainerShape::Rect {
+                width: 200.0,
+                height: 100.0,
+            },
+            ContainerShape::RoundedRect {
+                width: 150.0,
+                height: 80.0,
+                radius: 10.0,
+            },
+            ContainerShape::Circle { diameter: 100.0 },
+            ContainerShape::Heart { width: 120.0 },
+            ContainerShape::Custom {
+                path: square(0.0, 0.0, 50.0),
+            },
+        ];
+
+        for shape in &shapes {
+            let ron_str = ron::ser::to_string_pretty(shape, ron::ser::PrettyConfig::default())
+                .unwrap_or_else(|e| panic!("RON serialize failed for {:?}: {}", shape, e));
+            let roundtripped: ContainerShape =
+                ron::from_str(&ron_str).unwrap_or_else(|e| {
+                    panic!(
+                        "RON deserialize failed for\n{}\nerror: {}",
+                        ron_str, e
+                    )
+                });
+            // 比较 BezPath 输出（而非 Debug repr，后者不保证相等）
+            let original_bp = shape.to_bezpath();
+            let rt_bp = roundtripped.to_bezpath();
+            assert_eq!(
+                format!("{:?}", original_bp.elements()),
+                format!("{:?}", rt_bp.elements()),
+                "BezPath mismatch after roundtrip for {:?}",
+                shape
+            );
+        }
+    }
+
+    /// LayoutElement 的 RON roundtrip
+    #[test]
+    fn test_layout_element_ron_roundtrip() {
+        let mut elem = LayoutElement::new("test", 100.0, 50.0);
+        elem.constraints.min_width = Some(30.0);
+        elem.constraints.max_width = Some(200.0);
+        elem.constraints.size_strategy = SizeStrategy::Fill;
+        elem.margin = ElementMargin::horizontal(10.0);
+        elem.baseline = Some(25.0);
+
+        let ron_str =
+            ron::ser::to_string_pretty(&elem, ron::ser::PrettyConfig::default()).unwrap();
+        let roundtripped: LayoutElement = ron::from_str(&ron_str).unwrap();
+
+        assert_eq!(elem.id, roundtripped.id);
+        assert!((elem.width - roundtripped.width).abs() < 1e-9);
+        assert!((elem.height - roundtripped.height).abs() < 1e-9);
+        assert_eq!(elem.constraints.min_width, roundtripped.constraints.min_width);
+        assert_eq!(elem.constraints.max_width, roundtripped.constraints.max_width);
+        assert_eq!(elem.constraints.size_strategy, roundtripped.constraints.size_strategy);
+        assert!((elem.margin.left - roundtripped.margin.left).abs() < 1e-9);
+        assert_eq!(elem.baseline, roundtripped.baseline);
+    }
+
+    /// LayoutConfig 的 RON roundtrip
+    #[test]
+    fn test_layout_config_ron_roundtrip() {
+        let config = LayoutConfig {
+            padding_top: 10.0,
+            padding_bottom: 10.0,
+            padding_left: 15.0,
+            padding_right: 15.0,
+            gap: 5.0,
+            line_spacing: 8.0,
+            min_width: Some(1.0),
+            step_size: 2.0,
+            halign: HAlign::Center,
+            valign: VAlign::Baseline,
+        };
+
+        let ron_str =
+            ron::ser::to_string_pretty(&config, ron::ser::PrettyConfig::default()).unwrap();
+        // 验证 RON 字符串不包含未解析的结构体名
+        assert!(
+            !ron_str.contains("unwrap"),
+            "RON should not contain Rust internals"
+        );
+
+        let roundtripped: LayoutConfig = ron::from_str(&ron_str).unwrap();
+        assert!((config.padding_top - roundtripped.padding_top).abs() < 1e-9);
+        assert!((config.gap - roundtripped.gap).abs() < 1e-9);
+        assert_eq!(config.halign, roundtripped.halign);
+        assert_eq!(config.valign, roundtripped.valign);
+    }
+
+    /// LayoutSolution 的 RON roundtrip
+    #[test]
+    fn test_layout_solution_ron_roundtrip() {
+        let solution = LayoutSolution {
+            placed: vec![
+                PlacedElement {
+                    id: "a".into(),
+                    x: 10.0,
+                    y: 50.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+                PlacedElement {
+                    id: "b".into(),
+                    x: 95.0,
+                    y: 50.0,
+                    width: 80.0,
+                    height: 40.0,
+                },
+            ],
+            unplaced: vec!["c".into()],
+            warnings: vec![LayoutWarning::ElementTooWide {
+                element_id: "c".into(),
+                min_width: 200.0,
+                max_available: 100.0,
+            }],
+        };
+
+        let ron_str =
+            ron::ser::to_string_pretty(&solution, ron::ser::PrettyConfig::default()).unwrap();
+        let roundtripped: LayoutSolution = ron::from_str(&ron_str).unwrap();
+
+        assert_eq!(solution.placed.len(), roundtripped.placed.len());
+        assert_eq!(solution.unplaced, roundtripped.unplaced);
+        assert_eq!(solution.warnings.len(), roundtripped.warnings.len());
+
+        for (orig, rt) in solution.placed.iter().zip(roundtripped.placed.iter()) {
+            assert_eq!(orig.id, rt.id);
+            assert!((orig.x - rt.x).abs() < 1e-9);
+            assert!((orig.y - rt.y).abs() < 1e-9);
+            assert!((orig.width - rt.width).abs() < 1e-9);
+            assert!((orig.height - rt.height).abs() < 1e-9);
+        }
+    }
+
+    /// 端到端 RON 工作流：ContainerShape + elements + config → 排版 → 结果 roundtrip
+    #[test]
+    fn test_end_to_end_ron_workflow() {
+        // 1. 准备容器（用 ContainerShape 而非手动 BezPath）
+        let container = ContainerShape::RoundedRect {
+            width: 200.0,
+            height: 100.0,
+            radius: 8.0,
+        };
+
+        // 2. 准备元素
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        fill_elem.margin = ElementMargin::horizontal(5.0);
+
+        let fixed_elem = LayoutElement::new("fixed", 40.0, 20.0);
+
+        let elements = vec![fill_elem, fixed_elem];
+
+        // 3. 配置
+        let config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+
+        // 4. 排版 → 用 layout_container（新 API）
+        let solution = layout_container(&container, &elements, &config);
+
+        assert!(
+            solution.is_fully_placed(),
+            "RON e2e workflow should place all elements, got unplaced: {:?}",
+            solution.unplaced
+        );
+
+        // 5. 序列化整个结果
+        let ron_str =
+            ron::ser::to_string_pretty(&solution, ron::ser::PrettyConfig::default()).unwrap();
+
+        // 6. 反序列化
+        let roundtripped: LayoutSolution = ron::from_str(&ron_str).unwrap();
+
+        assert_eq!(solution.placed.len(), roundtripped.placed.len());
+        assert!(roundtripped.is_fully_placed());
+
+        // 7. 验证关键数据
+        let fill = &roundtripped.placed[0];
+        assert!(fill.width > 20.0, "Fill element should be stretched, got {}", fill.width);
     }
 }

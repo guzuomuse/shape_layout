@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "异形容器内的扫描线排版引擎 — RangeGenerator (基于 ioverlay + kurbo)"
 
+[features]
+# 开启后输出排版诊断日志（开发调试用，MCP/AI 调用时关闭）
+verbose = []
+
 [dependencies]
 kurbo = { workspace = true }
 i_overlay = { workspace = true }
@@ -13,3 +17,4 @@ serde = { workspace = true, features = ["derive"] }
 [dev-dependencies]
 bevy = { workspace = true }
 rand = { workspace = true }
+ron = { workspace = true }

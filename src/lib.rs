@@ -44,12 +44,14 @@ pub mod engine;
 pub mod region;
 pub mod result;
 pub mod rules;
+pub mod shape;
 
 // ── 重导出（方便外部使用） ──
 pub use element::ElementConstraints;
 pub use element::ElementMargin;
 pub use element::LayoutElement;
 pub use element::SizeStrategy;
+pub use engine::layout_container;
 pub use engine::layout_rows;
 pub use region::RangeGenerator;
 pub use region::RowRange;
@@ -59,3 +61,4 @@ pub use result::PlacedElement;
 pub use rules::HAlign;
 pub use rules::LayoutConfig;
 pub use rules::VAlign;
+pub use shape::ContainerShape;

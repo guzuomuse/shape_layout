@@ -115,24 +115,55 @@ fn sample_heart_points(_heart: &BezPath, n: usize) -> Vec<Vec2> {
 // 预设场景
 // ═══════════════════════════════════════════════════════════════
 
-/// 场景 1: 基础 Fixed 元素 + 混合对齐
+/// 场景 1: 大量元素填满心形 (验证从上到下排版)
 fn scene_1() -> (Vec<LayoutElement>, LayoutConfig, &'static str) {
-    let mut logo = LayoutElement::new("logo", 80.0, 40.0);
-    logo.margin = ElementMargin::uniform(5.0);
+    let mut elements = Vec::new();
 
-    let mut title = LayoutElement::new("title", 120.0, 30.0);
-    title.margin = ElementMargin {
-        top: 10.0,
-        bottom: 5.0,
-        left: 0.0,
-        right: 0.0,
-    };
+    // 生成 35 个大小不一的元素，故意超出心形容量以验证溢出
+    let names = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+        "U", "V", "W", "X", "Y", "Z", "a1", "b2", "c3", "d4",
+        "e5", "f6", "g7", "h8", "i9",
+    ];
 
-    let desc = LayoutElement::new("desc", 100.0, 20.0);
+    let sizes = [
+        (80.0, 35.0), (120.0, 28.0), (65.0, 22.0), (95.0, 30.0),
+        (50.0, 18.0), (110.0, 25.0), (70.0, 20.0), (40.0, 16.0),
+        (130.0, 32.0), (55.0, 24.0), (90.0, 20.0), (75.0, 28.0),
+        (100.0, 22.0), (45.0, 18.0), (85.0, 30.0), (60.0, 20.0),
+        (140.0, 35.0), (35.0, 15.0), (105.0, 26.0), (70.0, 22.0),
+        (50.0, 20.0), (90.0, 25.0), (65.0, 18.0), (80.0, 22.0),
+        (120.0, 28.0), (45.0, 16.0), (95.0, 24.0), (55.0, 20.0),
+        (75.0, 25.0), (40.0, 18.0), (100.0, 30.0), (60.0, 22.0),
+        (85.0, 20.0), (110.0, 28.0), (70.0, 24.0),
+    ];
 
-    let elements = vec![logo, title, desc];
-    let config = LayoutConfig::with_spacing(8.0, 6.0, 6.0);
-    (elements, config, "场景1: 纯Fixed + 混合对齐")
+    for (i, ((w, h), name)) in sizes.iter().zip(names.iter()).enumerate() {
+        let mut elem = LayoutElement::new(*name, *w, *h);
+
+        // 部分元素添加 margin
+        if i % 4 == 0 {
+            elem.margin = ElementMargin::uniform(4.0);
+        }
+
+        // 部分元素设为 Fill
+        if i % 5 == 0 {
+            elem.constraints.size_strategy = SizeStrategy::Fill;
+            elem.constraints.max_width = Some(160.0);
+        }
+
+        // 部分元素设为 Shrinkable
+        if i % 7 == 0 {
+            elem.constraints.size_strategy = SizeStrategy::Fixed { shrinkable: true };
+            elem.constraints.min_width = Some(20.0);
+        }
+
+        elements.push(elem);
+    }
+
+    let config = LayoutConfig::with_spacing(6.0, 4.0, 4.0);
+    (elements, config, "场景1: 35元素填满心形(上→下)")
 }
 
 /// 场景 2: Fill 弹性拉伸
@@ -176,15 +207,19 @@ fn scene_3() -> (Vec<LayoutElement>, LayoutConfig, &'static str) {
 /// 随机场景
 fn random_scene() -> (Vec<LayoutElement>, LayoutConfig, &'static str) {
     let mut rng = rand::rng();
-    let count = rng.random_range(3..=8);
-
+    let count = rng.random_range(20..=40);
     let strategies = [
         SizeStrategy::Fixed { shrinkable: false },
         SizeStrategy::Fixed { shrinkable: true },
         SizeStrategy::Fill,
     ];
 
-    let names = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    let names = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+        "U", "V", "W", "X", "Y", "Z", "a1", "b2", "c3", "d4",
+        "e5", "f6", "g7", "h8", "i9", "j0", "k!", "l@", "m#", "n$",
+    ];
 
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
