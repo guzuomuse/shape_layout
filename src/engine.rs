@@ -208,6 +208,15 @@ pub fn layout_rows(
             row_height = max_ascent + max_descent;
         }
 
+        // 🛡️ 行间 Y 轴安全网：在 refined query 之前先修正 y，
+        // 避免 refined 区间基于旧 y 计算导致最后一行溢出轮廓
+        // （旧 y 离容器顶部更远→轮廓更宽→区间过宽→元素放到新 y 时溢出）
+        let mut safety_net_triggered = false;
+        if y + row_height > prev_row_bottom + 1e-9 {
+            y = prev_row_bottom - row_height;
+            safety_net_triggered = true;
+        }
+
         // 用实际行高重新查询区间（行内可能有更高元素改变了有效高度）
         let refined_row = rg.get_intervals_at(y, row_height, config.min_width);
         let mut refinement_applied = false;
@@ -232,7 +241,6 @@ pub fn layout_rows(
 
         // 校验 refinement 后的区间仍能容纳行内元素（防止沙漏形容器因行高增大
         // 导致区间缩水到放不下已打包元素）
-        let mut safety_net_triggered = false;
         if !row_indices.is_empty() {
             let row_min_span: f64 = row_indices
                 .iter()
@@ -287,14 +295,6 @@ pub fn layout_rows(
                     interval_r = best_iv.1 - config.padding_right;
                 }
             }
-        }
-
-        // 🛡️ 行间 Y 轴安全网：当本行顶部高于上一行底部时（即高行侵入矮行），
-        // 强制将本行压到上一行底部之下，保证两行不重叠。
-        // 触发场景：下一行高度 > 当前行高度 + 行间距
-        if y + row_height > prev_row_bottom + 1e-9 {
-            y = prev_row_bottom - row_height;
-            safety_net_triggered = true;
         }
 
         // 🔍 诊断日志：Refinement & Safety Net
