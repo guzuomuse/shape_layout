@@ -48,6 +48,7 @@ impl SizeStrategy {
 /// `width` / `height` 是元素的**首选尺寸**（偏好值），
 /// 实际排出的尺寸受 `constraints` 和布局上下文影响。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutElement {
     /// 元素唯一标识（对 AI/用户友好）
     pub id: String,

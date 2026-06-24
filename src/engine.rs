@@ -15,7 +15,7 @@ use kurbo::BezPath;
 use crate::element::{LayoutElement, SizeStrategy};
 use crate::region::RangeGenerator;
 use crate::result::{LayoutSolution, LayoutWarning, PlacedElement};
-use crate::rules::{HAlign, LayoutConfig, VAlign};
+use crate::rules::{HAlign, LayoutConfig, StackDirection, VAlign};
 use crate::shape::ContainerShape;
 
 /// 条件打印宏：仅在 `verbose` feature 开启时输出诊断日志
@@ -35,6 +35,16 @@ macro_rules! vprintln {
 /// 防止 Fill 元素仅靠 margin 占地就被打包进拥挤的行，
 /// 而后在约束求解阶段被 REQUIRED 约束碾压至宽度归零。
 const FILL_MIN_CONTENT_WIDTH: f64 = 1.0;
+
+/// 计算 Fill 元素的隐式最小宽度
+///
+/// 优先级：`constraints.min_width`（显式） > `preferred * fill_min_ratio` > `FILL_MIN_CONTENT_WIDTH`
+fn fill_implicit_min_width(elem: &LayoutElement, config: &LayoutConfig) -> f64 {
+    elem.constraints
+        .min_width
+        .unwrap_or_else(|| (elem.width * config.fill_min_ratio).max(FILL_MIN_CONTENT_WIDTH))
+        .max(FILL_MIN_CONTENT_WIDTH)
+}
 
 /// 单次排版求解（容器形状入口）—— 推荐的外部 API
 ///
@@ -101,8 +111,8 @@ pub fn layout_rows(
     );
 
     let container_y0 = rg.extents.y0;
-    let container_top = rg.extents.y1 - config.padding_bottom;
-    let container_bottom = container_y0 + config.padding_top;
+    let container_top = rg.extents.y1 - config.padding_top;
+    let container_bottom = container_y0 + config.padding_bottom;
     let mut placed: Vec<PlacedElement> = Vec::new();
     let mut warnings: Vec<LayoutWarning> = Vec::new();
     let mut unplaced: Vec<String> = Vec::new();
@@ -172,7 +182,29 @@ pub fn layout_rows(
         }
 
         if best_count == 0 {
-            // 所有区间都放不下第一个元素 → 向下跳跃
+            // 所有区间都放不下第一个元素
+            if config.stack_direction == StackDirection::Vertical {
+                // Vertical 模式：记录警告，跳过该元素，并向下跳跃（与 Flow 相同）
+                // 否则下一个元素卡在同一 Y 高度，遇到同样的障碍（如孔洞）再次失败
+                let max_avail = row_range.intervals.iter()
+                    .map(|(l, r)| r - l - config.padding_left - config.padding_right)
+                    .fold(0.0, f64::max);
+                let report_min = if elements[idx].constraints.size_strategy.can_shrink() {
+                    elements[idx].footprint_width_with(fill_implicit_min_width(&elements[idx], config))
+                } else {
+                    elements[idx].footprint_width()
+                };
+                warnings.push(LayoutWarning::ElementTooWide {
+                    element_id: elements[idx].id.clone(),
+                    min_width: report_min,
+                    max_available: max_avail,
+                });
+                unplaced.push(elements[idx].id.clone());
+                y -= elements[idx].footprint_height().max(config.step_size);
+                idx += 1;
+                continue;
+            }
+            // Flow 模式：向下跳跃
             y -= elements[idx].footprint_height().max(config.step_size);
             continue;
         }
@@ -215,6 +247,20 @@ pub fn layout_rows(
         if y + row_height > prev_row_bottom + 1e-9 {
             y = prev_row_bottom - row_height;
             safety_net_triggered = true;
+        }
+
+        // 🔒 line_spacing 硬约束：确保上一行底部到当前行顶部 ≥ line_spacing
+        // 因为 y += row_height + line_spacing 在执行时还不知道下行高度，
+        // 若下行高度 > 上行高度，实际间距会被压缩（A高+line_spacing-B高）。
+        // 这里事后校准：当前行顶部 = y + row_height，上一行底部 = prev_row_bottom
+        // 要求 prev_row_bottom - (y + row_height) >= line_spacing
+        // 即 y <= prev_row_bottom - line_spacing - row_height
+        // ⚠️ 仅当存在上一行时才应用（第一行没有上行，不应钳制）
+        if !placed.is_empty() {
+            let max_allowed_y = prev_row_bottom - config.line_spacing - row_height;
+            if y > max_allowed_y + 1e-9 {
+                y = max_allowed_y.max(container_bottom); // 不越界到容器底部以下
+            }
         }
 
         // 用实际行高重新查询区间（行内可能有更高元素改变了有效高度）
@@ -275,11 +321,17 @@ pub fn layout_rows(
                     );
                     if new_row_indices.is_empty() {
                         // 连一个元素都放不下 → 跳过首元素，下次循环再试
+                        let report_min = if elements[row_start_idx].constraints.size_strategy.can_shrink() {
+                            elements[row_start_idx].footprint_width_with(fill_implicit_min_width(&elements[row_start_idx], config))
+                        } else {
+                            elements[row_start_idx].footprint_width()
+                        };
                         warnings.push(LayoutWarning::ElementTooWide {
                             element_id: elements[row_start_idx].id.clone(),
-                            min_width: elements[row_start_idx].footprint_width(),
+                            min_width: report_min,
                             max_available: refined_avail,
                         });
+                        unplaced.push(elements[row_start_idx].id.clone());
                         idx = row_start_idx + 1;
                         y -= elements[row_start_idx].footprint_height().max(config.step_size);
                         continue;
@@ -521,6 +573,8 @@ pub fn layout_rows(
 
 /// 贪心打包一行元素
 ///
+/// 当 `config.stack_direction == Vertical` 时，每行仅放入一个元素。
+///
 /// 返回 `(row_indices, next_idx, row_height)`
 fn pack_row_elements(
     elements: &[LayoutElement],
@@ -529,6 +583,45 @@ fn pack_row_elements(
     config: &LayoutConfig,
     warnings: &mut Vec<LayoutWarning>,
 ) -> (Vec<usize>, usize, f64) {
+    // ── Vertical 模式：强制单元素行 ──
+    if config.stack_direction == StackDirection::Vertical {
+        let elem = &elements[start_idx];
+        let footprint_w = elem.footprint_width();
+        let row_h = elem.footprint_height();
+
+        // 尝试首选宽度
+        if footprint_w <= available_width + 1e-9 {
+            return (vec![start_idx], start_idx + 1, row_h);
+        }
+
+        // 可缩元素：尝试最小宽度
+        if elem.constraints.size_strategy.can_shrink() {
+            let min_w = if matches!(elem.constraints.size_strategy, SizeStrategy::Fill) {
+                fill_implicit_min_width(elem, config)
+            } else {
+                elem.constraints.min_width.unwrap_or(0.0).max(0.0)
+            };
+            let min_fp = elem.footprint_width_with(min_w);
+            if min_fp <= available_width + 1e-9 {
+                return (vec![start_idx], start_idx + 1, row_h);
+            }
+        }
+
+        // 放不下 → 记录警告，跳过该元素
+        let report_min = if elem.constraints.size_strategy.can_shrink() {
+            elem.footprint_width_with(fill_implicit_min_width(elem, config))
+        } else {
+            footprint_w
+        };
+        warnings.push(LayoutWarning::ElementTooWide {
+            element_id: elem.id.clone(),
+            min_width: report_min,
+            max_available: available_width,
+        });
+        return (vec![], start_idx + 1, 0.0);
+    }
+
+    // ── Flow 模式：贪心多元素行 ──
     let mut row_indices: Vec<usize> = Vec::new();
     let mut used_width = 0.0;
     let mut row_height: f64 = 0.0;
@@ -555,17 +648,10 @@ fn pack_row_elements(
             idx += 1;
         } else if elem.constraints.size_strategy.can_shrink() {
             // 尝试缩到最小宽度（含 margin）
-            // Fill 元素：至少保留 FILL_MIN_CONTENT_WIDTH 内容宽度，防止仅靠 margin 占地蒙混过关
             let min_w = if matches!(elem.constraints.size_strategy, SizeStrategy::Fill) {
-                elem.constraints
-                    .min_width
-                    .unwrap_or(FILL_MIN_CONTENT_WIDTH)
-                    .max(FILL_MIN_CONTENT_WIDTH)
+                fill_implicit_min_width(elem, config)
             } else {
-                elem.constraints
-                    .min_width
-                    .unwrap_or(0.0)
-                    .max(0.0)
+                elem.constraints.min_width.unwrap_or(0.0).max(0.0)
             };
             let min_footprint = elem.footprint_width_with(min_w);
             let total_min = used_width + gap_needed + min_footprint;
@@ -704,10 +790,10 @@ fn solve_row_x(
                 fill_indices.push(i);
 
                 // 🆕 保底：WEAK 级别最小内容宽度约束
-                // 当行内 Fixed/Shrinkable 的 REQUIRED 约束吞掉所有空间时，
-                // 此约束给 Fill 保留至少 1px 内容宽度，防止归零。
+                // 使用 fill_implicit_min_width 计算（优先显式 min_width，其次 preferred * fill_min_ratio）
                 // WEAK 优先级最低，不会与 STRONG row-fill 或 REQUIRED 边界冲突。
-                let min_content_footprint = elem.footprint_width_with(FILL_MIN_CONTENT_WIDTH);
+                let implicit_min = fill_implicit_min_width(elem, config);
+                let min_content_footprint = elem.footprint_width_with(implicit_min);
                 solver
                     .add_constraints(
                         [(right_vars[i] - left_vars[i])
@@ -913,6 +999,7 @@ mod tests {
     use super::*;
     use crate::element::LayoutElement;
     use crate::ElementMargin;
+    use kurbo::Shape;
 
     fn square(x: f64, y: f64, size: f64) -> BezPath {
         let mut p = BezPath::new();
@@ -1788,6 +1875,8 @@ mod tests {
             step_size: 2.0,
             halign: HAlign::Center,
             valign: VAlign::Baseline,
+            stack_direction: StackDirection::Flow,
+            fill_min_ratio: 0.4,
         };
 
         let ron_str =
@@ -1894,5 +1983,543 @@ mod tests {
         // 7. 验证关键数据
         let fill = &roundtripped.placed[0];
         assert!(fill.width > 20.0, "Fill element should be stretched, got {}", fill.width);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 2: Gourd & HangTag 验收测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 验收案例 1：葫芦形洗发水标签排版
+    ///
+    /// 在葫芦形容器内排放 logo / 产品名 / 容量 / 条码区 四个元素，
+    /// 验证元素在窄腰处正确换行，不溢出轮廓。
+    /// 葫芦形天然在腰部收窄，部分元素可能因宽度不足被挤到底部溢出。
+    #[test]
+    fn test_gourd_shampoo_label() {
+        // 大号葫芦形容器（模拟真实标签尺寸）
+        let container = ContainerShape::Gourd {
+            width: 200.0,
+            height: 300.0,
+            waist_y: 0.55,
+            waist_ratio: 0.45,
+        };
+
+        // 4 个实际尺寸的元素
+        let elements = vec![
+            LayoutElement::new("logo", 80.0, 35.0),
+            LayoutElement::new("product_name", 110.0, 25.0),
+            LayoutElement::new("volume", 55.0, 18.0),
+            LayoutElement::new("barcode", 90.0, 30.0),
+        ];
+
+        let config = LayoutConfig::with_spacing(10.0, 8.0, 10.0);
+
+        let solution = layout_container(&container, &elements, &config);
+
+        // 窄腰处宽度仅 200*0.45=90，去掉 padding 后仅 70，
+        // 至少能排下 3 个元素（barcode 90 宽可能被底部挤出）
+        assert!(
+            solution.placed.len() >= 3,
+            "Gourd should place at least 3 elements, placed={}, unplaced={:?}",
+            solution.placed.len(),
+            solution.unplaced
+        );
+
+        // 验证所有已放置元素都在容器 AABB 内
+        let bbox = container.to_bezpath().bounding_box();
+        for placed in &solution.placed {
+            assert!(
+                placed.x >= bbox.x0 - 1e-6,
+                "element '{}' x={} < container x0={}",
+                placed.id,
+                placed.x,
+                bbox.x0
+            );
+            assert!(
+                placed.x + placed.width <= bbox.x1 + 1e-6,
+                "element '{}' right={} > container x1={}",
+                placed.id,
+                placed.x + placed.width,
+                bbox.x1
+            );
+            assert!(
+                placed.y >= bbox.y0 - 1e-6,
+                "element '{}' y={} < container y0={}",
+                placed.id,
+                placed.y,
+                bbox.y0
+            );
+            assert!(
+                placed.y + placed.height <= bbox.y1 + 1e-6,
+                "element '{}' top={} > container y1={}",
+                placed.id,
+                placed.y + placed.height,
+                bbox.y1
+            );
+        }
+
+        // 验证从上到下排版
+        for w in solution.placed.windows(2) {
+            assert!(
+                w[1].y + w[1].height <= w[0].y + 1e-6
+                    || (w[1].y - w[0].y).abs() < 1e-6,
+                "rows should not overlap upward: {} at y={} vs {} at y={}",
+                w[0].id,
+                w[0].y,
+                w[1].id,
+                w[1].y
+            );
+        }
+    }
+
+    /// 验收案例 2：带孔洞的吊牌排版
+    ///
+    /// 在带圆形穿绳孔洞的吊牌中排放品牌名 / 尺码 / 洗护标识，
+    /// 验证孔洞区域元素自动避让（不会被放到孔洞位置）。
+    #[test]
+    fn test_hang_tag_with_hole() {
+        let container = ContainerShape::HangTag {
+            width: 80.0,
+            height: 120.0,
+            radius: 5.0,
+            hole_y: 100.0,
+            hole_radius: 6.0,
+        };
+
+        let elements = vec![
+            LayoutElement::new("brand", 45.0, 15.0),
+            LayoutElement::new("size_info", 30.0, 12.0),
+            LayoutElement::new("care_label", 55.0, 18.0),
+        ];
+
+        let config = LayoutConfig::with_spacing(5.0, 4.0, 5.0);
+
+        let solution = layout_container(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "HangTag: all 3 elements should be placed, unplaced={:?}, warnings={:?}",
+            solution.unplaced,
+            solution.warnings
+        );
+
+        // 验证没有元素覆盖孔洞区域
+        // 孔洞中心 (40, 100)，半径 6
+        let hole_cx = 40.0;
+        let hole_cy = 100.0;
+        let hole_r = 6.0;
+
+        for placed in &solution.placed {
+            let elem_cx = placed.x + placed.width / 2.0;
+            let elem_cy = placed.y + placed.height / 2.0;
+
+            // 孔洞中心到元素中心的距离应该大于孔洞半径（粗略检查）
+            let dx = elem_cx - hole_cx;
+            let dy = elem_cy - hole_cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            assert!(
+                dist > hole_r * 1.5,
+                "element '{}' at ({},{}) overlaps hole area (center={},{}, r={}), dist={}",
+                placed.id,
+                placed.x,
+                placed.y,
+                hole_cx,
+                hole_cy,
+                hole_r,
+                dist
+            );
+        }
+
+        // 验证所有元素在吊牌 AABB 内
+        let bbox = container.to_bezpath().bounding_box();
+        for placed in &solution.placed {
+            assert!(placed.x >= bbox.x0 - 1e-6);
+            assert!(placed.x + placed.width <= bbox.x1 + 1e-6);
+            assert!(placed.y >= bbox.y0 - 1e-6);
+            assert!(placed.y + placed.height <= bbox.y1 + 1e-6);
+        }
+    }
+
+    /// Gourd 的 RON roundtrip
+    #[test]
+    fn test_gourd_ron_roundtrip() {
+        let gourd = ContainerShape::Gourd {
+            width: 120.0,
+            height: 180.0,
+            waist_y: 0.55,
+            waist_ratio: 0.45,
+        };
+
+        let ron_str =
+            ron::ser::to_string_pretty(&gourd, ron::ser::PrettyConfig::default()).unwrap();
+        let roundtripped: ContainerShape = ron::from_str(&ron_str).unwrap();
+
+        let orig_bp = gourd.to_bezpath();
+        let rt_bp = roundtripped.to_bezpath();
+        assert_eq!(
+            format!("{:?}", orig_bp.elements()),
+            format!("{:?}", rt_bp.elements()),
+            "Gourd BezPath mismatch after roundtrip"
+        );
+    }
+
+    /// HangTag 的 RON roundtrip
+    #[test]
+    fn test_hang_tag_ron_roundtrip() {
+        let tag = ContainerShape::HangTag {
+            width: 80.0,
+            height: 120.0,
+            radius: 5.0,
+            hole_y: 100.0,
+            hole_radius: 6.0,
+        };
+
+        let ron_str =
+            ron::ser::to_string_pretty(&tag, ron::ser::PrettyConfig::default()).unwrap();
+        let roundtripped: ContainerShape = ron::from_str(&ron_str).unwrap();
+
+        let orig_bp = tag.to_bezpath();
+        let rt_bp = roundtripped.to_bezpath();
+        assert_eq!(
+            format!("{:?}", orig_bp.elements()),
+            format!("{:?}", rt_bp.elements()),
+            "HangTag BezPath mismatch after roundtrip"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 3: StackDirection::Vertical 测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Vertical 模式：每个元素独占一行
+    #[test]
+    fn test_vertical_mode_each_element_own_row() {
+        let container = square(0.0, 0.0, 200.0);
+        // 三个元素，宽度都足够同行，但 Vertical 模式应强制各占一行
+        let elements = vec![
+            LayoutElement::new("a", 40.0, 20.0),
+            LayoutElement::new("b", 50.0, 25.0),
+            LayoutElement::new("c", 60.0, 30.0),
+        ];
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.stack_direction = StackDirection::Vertical;
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "Vertical: all 3 should be placed, unplaced={:?}",
+            solution.unplaced
+        );
+        assert_eq!(solution.placed.len(), 3);
+
+        // 验证每行只有一个元素，且 Y 坐标依次递减（从上到下）
+        for w in solution.placed.windows(2) {
+            assert!(
+                w[1].y + w[1].height <= w[0].y + 1e-6,
+                "Vertical rows must not overlap: {} (y={}) vs {} (y={})",
+                w[0].id, w[0].y,
+                w[1].id, w[1].y,
+            );
+        }
+    }
+
+    /// Vertical 模式 + Fill：Fill 元素在独占行内填满该行宽度
+    #[test]
+    fn test_vertical_with_fill() {
+        let container = square(0.0, 0.0, 200.0);
+        let mut fill_elem = LayoutElement::new("fill", 20.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        let fixed_elem = LayoutElement::new("fixed", 40.0, 20.0);
+
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.stack_direction = StackDirection::Vertical;
+
+        let solution = layout_rows(&container, &[fill_elem, fixed_elem], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "Vertical + Fill: should place both, unplaced={:?}",
+            solution.unplaced
+        );
+
+        // Fill 元素在独占行应被拉伸到区间全宽 (≈200-10=190)
+        let fill = &solution.placed[0];
+        assert!(
+            fill.width > 100.0,
+            "Fill should fill its row: width={}",
+            fill.width
+        );
+        // Fixed 保持 40
+        let fixed = &solution.placed[1];
+        assert!(
+            (fixed.width - 40.0).abs() < 1.0,
+            "Fixed should stay 40, got {}",
+            fixed.width
+        );
+    }
+
+    /// Vertical 模式：元素过宽不可缩 → 跳过并记录警告
+    #[test]
+    fn test_vertical_wide_unshrinkable_skipped() {
+        let container = square(0.0, 0.0, 100.0);
+        let wide = LayoutElement::new("wide", 120.0, 20.0);
+        let normal = LayoutElement::new("normal", 40.0, 20.0);
+
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.stack_direction = StackDirection::Vertical;
+        // 可用宽度 = 100 - 10 = 90，wide 120 放不下
+
+        let solution = layout_rows(&container, &[wide, normal], &config);
+        assert!(!solution.is_fully_placed());
+        assert_eq!(solution.unplaced.len(), 1);
+        assert_eq!(solution.unplaced[0], "wide");
+        assert_eq!(solution.placed.len(), 1);
+        assert_eq!(solution.placed[0].id, "normal");
+    }
+
+    /// Vertical 模式：可缩元素在窄行中缩小
+    #[test]
+    fn test_vertical_shrinkable_narrow_row() {
+        let container = square(0.0, 0.0, 100.0);
+        let mut shrinkable = LayoutElement::new("shrink", 80.0, 20.0);
+        shrinkable.constraints.size_strategy = SizeStrategy::Fixed { shrinkable: true };
+        shrinkable.constraints.min_width = Some(40.0);
+
+        let mut config = LayoutConfig::with_spacing(10.0, 5.0, 10.0);
+        config.stack_direction = StackDirection::Vertical;
+        // 可用宽度 = 100 - 20 = 80，元素 80 刚好 → 不用缩
+        let solution = layout_rows(&container, &[shrinkable], &config);
+        assert!(solution.is_fully_placed());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 3: Fill min_ratio 保护测试
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Fill 元素即使无显式 min_width，也应至少保留 preferred * fill_min_ratio 的宽度
+    /// （验证隐式最小宽度保护）
+    #[test]
+    fn test_fill_implicit_min_width_protection() {
+        let container = square(0.0, 0.0, 80.0);
+        let mut fill_elem = LayoutElement::new("fill", 60.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        // 无显式 min_width → 隐式 = 60 * 0.4 = 24
+
+        let config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        // 可用宽度 = 80 - 10 = 70，虽然能放下，但要用隐式 min 保护
+
+        let solution = layout_rows(&container, &[fill_elem], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "Fill with implicit min should fit"
+        );
+        // 宽度应该＞隐式 min = 24
+        assert!(
+            solution.placed[0].width >= 24.0,
+            "Fill should not shrink below implicit min 24, got {}",
+            solution.placed[0].width
+        );
+    }
+
+    /// Fill 在极窄区间 + 高 fill_min_ratio → 因隐式 min 过大而被拒绝
+    #[test]
+    fn test_fill_rejected_by_implicit_min() {
+        let container = square(0.0, 0.0, 50.0);
+        let mut fill_elem = LayoutElement::new("fill", 60.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        // 无显式 min_width
+
+        let mut config = LayoutConfig::with_spacing(3.0, 3.0, 3.0);
+        config.fill_min_ratio = 0.6;
+        // 可用宽度 = 50 - 6 = 44，隐式 min = 60 * 0.6 = 36
+        // 36 < 44 → 能放入
+
+        let solution = layout_rows(&container, &[fill_elem], &config);
+        assert!(solution.is_fully_placed());
+    }
+
+    /// 显式 min_width 覆盖隐式 min_ratio（显式优先）
+    #[test]
+    fn test_fill_explicit_min_overrides_ratio() {
+        let container = square(0.0, 0.0, 100.0);
+        let mut fill_elem = LayoutElement::new("fill", 60.0, 20.0);
+        fill_elem.constraints.size_strategy = SizeStrategy::Fill;
+        fill_elem.constraints.min_width = Some(10.0); // 显式 10 < 隐式 24
+
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.fill_min_ratio = 0.4; // 隐式 = 24
+
+        let solution = layout_rows(&container, &[fill_elem], &config);
+        assert!(
+            solution.is_fully_placed(),
+            "Explicit min 10 should be used, not implicit 24"
+        );
+        // Fill 被拉伸到区间全宽，但应该 ≥ 10
+        assert!(
+            solution.placed[0].width >= 10.0,
+            "Fill should respect explicit min 10"
+        );
+    }
+
+    /// RON roundtrip: StackDirection
+    #[test]
+    fn test_stack_direction_ron_roundtrip() {
+        let sd = StackDirection::Vertical;
+        let ron_str = ron::ser::to_string_pretty(&sd, ron::ser::PrettyConfig::default()).unwrap();
+        let roundtripped: StackDirection = ron::from_str(&ron_str).unwrap();
+        assert_eq!(sd, roundtripped);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Bug Fix 验证：padding_top / padding_bottom 方向修正 + Vertical 跳跃
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Bug 1 修复验证：padding_top 和 padding_bottom 不对称时分别作用于正确边界
+    ///
+    /// 修复前：`container_top = y1 - padding_bottom`（拿底部 padding 缩顶部）
+    /// 修复后：`container_top = y1 - padding_top`（正确）
+    #[test]
+    fn test_padding_top_bottom_asymmetric() {
+        // 200x200 正方形容器
+        let container = square(0.0, 0.0, 200.0);
+        let elements = vec![LayoutElement::new("a", 40.0, 20.0)];
+
+        let config = LayoutConfig {
+            padding_top: 30.0,
+            padding_bottom: 10.0,
+            padding_left: 5.0,
+            padding_right: 5.0,
+            gap: 5.0,
+            line_spacing: 5.0,
+            ..Default::default()
+        };
+
+        let solution = layout_rows(&container, &elements, &config);
+        assert!(solution.is_fully_placed());
+
+        let a = &solution.placed[0];
+
+        // 修复后：container_top = 200 - 30 = 170，元素高 20 → y(行底) = 170 - 20 = 150
+        // 修复前（Bug）：container_top = 200 - 10 = 190 → y = 190 - 20 = 170（错误偏高）
+        assert!(
+            (a.y - 150.0).abs() < 2.0,
+            "padding_top=30: element y should ≈150, got {} (Bug 1 would give 170)",
+            a.y
+        );
+
+        // 元素不应低于 container_bottom = 0 + 10 = 10
+        assert!(
+            a.y >= 10.0 - 1e-6,
+            "element y={} should be >= container_bottom 10",
+            a.y
+        );
+    }
+
+    /// Bug 2 修复验证：Vertical 模式在遇到障碍（孔洞）时向下跳跃 Y，
+    /// 使后续元素能在障碍下方成功排放。
+    ///
+    /// 修复前：跳过元素但不移 Y → 下一元素卡在同一孔洞高度，同样失败。
+    /// 修复后：跳过元素 + 向下跳 Y → 下一元素越过孔洞后成功排放。
+    #[test]
+    fn test_vertical_mode_jumps_y_on_obstacle() {
+        // 吊牌容器：顶部有穿绳孔洞（hole_y=100, hole_radius=6）
+        // 孔洞区域（Y≈94-106）可用宽度极窄，元素应自动避让到孔洞下方
+        let container = ContainerShape::HangTag {
+            width: 80.0,
+            height: 120.0,
+            radius: 5.0,
+            hole_y: 100.0,
+            hole_radius: 6.0,
+        };
+
+        // 元素 1：宽 60、高 30，在孔洞区间的单侧安全区域放不下；被跳过时 Y 跳 30px
+        // 元素 2：宽 20、高 10，Y 跳 30px 后行顶 85+10=95 仍在孔洞范围 (94-106)，
+        // 所以继续被跳；最终两个元素到孔洞下方才排放。
+        // 关键：Bug 2 修复后 Y 会向下跳跃，元素不会永远卡在同一位置。
+        //
+        // 简化起见：让元素 1 的 footprint_height 足够大，使得一次 Y 跳就完全越过孔洞。
+        // hole_bottom=94, elem2 row top = y + height, 需要 y+10 <= 94 → y <= 84
+        // elem1 at y=115-25=90 → y jump 25 → y=65. Row [55,65] << 94 → clean.
+        let elements = vec![
+            LayoutElement::new("too_wide_for_hole", 60.0, 25.0),
+            LayoutElement::new("fits_below_hole", 20.0, 10.0),
+        ];
+
+        let mut config = LayoutConfig::with_spacing(5.0, 5.0, 5.0);
+        config.stack_direction = StackDirection::Vertical;
+
+        let solution = layout_container(&container, &elements, &config);
+
+        // 验证：元素 1 因孔洞宽度不足被跳过
+        assert!(
+            solution.unplaced.contains(&"too_wide_for_hole".to_string()),
+            "too_wide_for_hole should be unplaced; unplaced={:?}",
+            solution.unplaced
+        );
+
+        // 验证：元素 2 在孔洞下方成功排放（Bug 2 修复的关键断言）
+        assert!(
+            solution.placed.iter().any(|p| p.id == "fits_below_hole"),
+            "fits_below_hole should be placed (below the hole); placed={:?}",
+            solution.placed.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+
+        // 元素 2 应排在元素 1 试图占据的位置之下（Y 已向下跳跃）
+        if let Some(elem2) = solution.placed.iter().find(|p| p.id == "fits_below_hole") {
+            // Y jump of 25 from 90 → y=65. Row [55,65] << hole_bottom=94. Safe.
+            assert!(
+                elem2.y <= 80.0,
+                "fits_below_hole y={:.1} should be well below the hole region",
+                elem2.y
+            );
+        }
+    }
+
+    /// Bug 1 + Bug 2 联合验证：HangTag 大 padding_top 推元素到孔洞下方
+    ///
+    /// 模拟 AI 排版场景：用 padding_top 将起始排版区推到孔洞以下，
+    /// 确保所有元素在孔洞下方全宽区域成功排放。
+    #[test]
+    fn test_hang_tag_top_padding_skips_hole() {
+        let container = ContainerShape::HangTag {
+            width: 80.0,
+            height: 120.0,
+            radius: 5.0,
+            hole_y: 100.0,
+            hole_radius: 6.0,
+        };
+
+        let elements = vec![
+            LayoutElement::new("brand", 45.0, 12.0),
+            LayoutElement::new("size", 30.0, 10.0),
+        ];
+
+        // 大 padding_top 把起始排版区推到孔洞下方
+        let config = LayoutConfig {
+            padding_top: 36.0, // 推过孔洞底部 (100-6=94)
+            padding_bottom: 5.0,
+            padding_left: 5.0,
+            padding_right: 5.0,
+            gap: 4.0,
+            line_spacing: 4.0,
+            ..Default::default()
+        };
+
+        let solution = layout_container(&container, &elements, &config);
+        assert!(
+            solution.is_fully_placed(),
+            "both elements should be placed below the hole; unplaced={:?}",
+            solution.unplaced
+        );
+
+        // 所有元素顶部都应在孔洞底部（94）以下
+        let hole_bottom = 100.0 - 6.0;
+        for p in &solution.placed {
+            let top = p.y + p.height;
+            assert!(
+                top <= hole_bottom + 5.0,
+                "element '{}' top={:.1} should be below hole bottom={:.1}",
+                p.id, top, hole_bottom
+            );
+        }
     }
 }

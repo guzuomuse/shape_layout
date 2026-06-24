@@ -57,6 +57,18 @@ pub enum LayoutWarning {
     },
 }
 
+/// MCP → 可视化 Demo 的桥接数据
+///
+/// 当 MCP Server 完成排版后，将完整上下文序列化到共享文件，
+/// Bevy 可视化 Demo 监听文件变化后自动刷新画面。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutVizState {
+    pub container: crate::shape::ContainerShape,
+    pub elements: Vec<crate::element::LayoutElement>,
+    pub config: crate::rules::LayoutConfig,
+    pub solution: LayoutSolution,
+}
+
 impl LayoutSolution {
     /// 快速构造一个容器无效的结果
     pub fn invalid_container(elements: &[super::element::LayoutElement]) -> Self {

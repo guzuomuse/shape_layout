@@ -16,5 +16,6 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 bevy = { workspace = true }
+pce_lyon = { workspace = true }
 rand = { workspace = true }
 ron = { workspace = true }

@@ -29,6 +29,19 @@ pub enum VAlign {
     Baseline,
 }
 
+/// 排版方向：控制元素在容器内的堆叠方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StackDirection {
+    /// 默认流式：从上到下贪心分行，同行内尽可能多地放置元素
+    #[default]
+    Flow,
+    /// 强制竖排：每个元素独占一行，同行内不放第二个元素
+    ///
+    /// 用于名片、标签竖排、海报等需要每个元素单独成行的场景。
+    /// Fill 元素在独占行内仍然会拉伸到该行可用宽度。
+    Vertical,
+}
+
 /// 全局排版配置——一次 `layout_rows()` 调用使用一套配置
 ///
 /// 所有尺寸单位为世界坐标（与容器坐标系一致）。
@@ -54,9 +67,21 @@ pub struct LayoutConfig {
     /// 行内水平对齐
     #[serde(default)]
     pub halign: HAlign,
-    /// 垂直对齐（Phase 1 预留）
+    /// 垂直对齐
     #[serde(default)]
     pub valign: VAlign,
+    /// 排版方向
+    #[serde(default)]
+    pub stack_direction: StackDirection,
+    /// Fill 元素的隐式最小宽度比例
+    ///
+    /// 当 Fill 元素未显式设置 `constraints.min_width` 时，
+    /// 以此比例 × `preferred_width` 作为隐式下限，
+    /// 防止 Fill 在狭窄区域被压缩至无法辨认的尺寸。
+    /// 默认 0.4（即至少保留首选宽度的 40%），
+    /// 当计算值 < 1.0 时回退到 1.0（`FILL_MIN_CONTENT_WIDTH`）。
+    #[serde(default = "default_fill_min_ratio")]
+    pub fill_min_ratio: f64,
 }
 
 impl Default for LayoutConfig {
@@ -72,12 +97,18 @@ impl Default for LayoutConfig {
             step_size: 0.5,
             halign: HAlign::Left,
             valign: VAlign::Top,
+            stack_direction: StackDirection::Flow,
+            fill_min_ratio: default_fill_min_ratio(),
         }
     }
 }
 
 fn default_step_size() -> f64 {
     0.5
+}
+
+fn default_fill_min_ratio() -> f64 {
+    0.4
 }
 
 impl LayoutConfig {

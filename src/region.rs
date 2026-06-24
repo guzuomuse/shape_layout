@@ -7,6 +7,7 @@ use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::i_float::float::compatible::FloatPointCompatible;
 use kurbo::{BezPath, PathEl, Rect};
+use serde::Serialize;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SPoint — ioverlay 兼容的点类型
@@ -156,7 +157,7 @@ fn rect_contour(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<SPoint> {
 /// 单一行的绝对安全区间
 ///
 /// `intervals` 中的每个 `(l, r)` 表示该行内 X 轴上一段连续的可用空间。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RowRange {
     /// 本行起始 Y 坐标
     pub y_start: f64,
